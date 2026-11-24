@@ -107,6 +107,8 @@ Launch your title through your Wine environment with the recommended Mac environ
 env XCL_TEXTURE_SKIP_UNCHANGED=0 XCL_NETWORK=0 wine64 xcl.exe run "C:\Games\YourTitle"
 ```
 
+GameInput retains half a second of recent gamepad changes for titles that read inputs between frames.
+
 ### Environment Variable Reference
 
 | Variable | Default (Mac) | Default (Win) | Purpose |
