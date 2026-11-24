@@ -22,6 +22,7 @@ pub mod kernelx;
 pub mod mfplat;
 pub mod netoff;
 pub mod opus;
+pub mod playstation;
 pub mod user;
 pub mod xaudio2;
 pub mod xma2;
