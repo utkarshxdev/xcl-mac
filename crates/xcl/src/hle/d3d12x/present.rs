@@ -1248,7 +1248,26 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         let (src, desc, _) = &resolved[0];
         let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
         p.list.ResourceBarrier(&b1);
-        p.list.CopyResource(&bb, src);
+        if desc.Width as u32 == p.w && desc.Height == p.h {
+            p.list.CopyResource(&bb, src);
+        } else if desc.Width > 0 && desc.Height > 0 && p.w > 0 && p.h > 0 {
+            let cw = (desc.Width as u32).min(p.w);
+            let ch = desc.Height.min(p.h);
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(bb.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(src.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let box_ = D3D12_BOX { left: 0, top: 0, front: 0, right: cw, bottom: ch, back: 1 };
+            p.list.CopyTextureRegion(&dst, 0, 0, 0, &src_loc, Some(&box_));
+            let _ = ManuallyDrop::into_inner(dst.pResource);
+            let _ = ManuallyDrop::into_inner(src_loc.pResource);
+        }
         if due {
             if let Some((buffer, footprint)) = readback_copy(&p.list, src, desc) {
                 dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
