@@ -3429,7 +3429,10 @@ unsafe extern "system" fn session_get_device(this: *mut DummyShaderCacheSession,
     qi(raw, riid, ppv)
 }
 
-unsafe extern "system" fn session_find_value(_this: *mut DummyShaderCacheSession, _key: *const c_void, _key_size: u32, _val: *mut c_void, _val_size: *mut u32) -> HRESULT {
+unsafe extern "system" fn session_find_value(_this: *mut DummyShaderCacheSession, _key: *const c_void, _key_size: u32, _val: *mut c_void, val_size: *mut u32) -> HRESULT {
+    if !val_size.is_null() {
+        *val_size = 0;
+    }
     CACHE_MISS
 }
 
@@ -6465,25 +6468,44 @@ mod console_format_query_tests {
             let dummy = create_dummy_shader_cache_session(std::ptr::null_mut(), desc_ptr);
             assert!(!dummy.is_null());
 
-            // 1. QueryInterface
+            // 1. QueryInterface (full COM inheritance hierarchy: IUnknown, ID3D12Object, ID3D12DeviceChild, ID3D12ShaderCacheSession)
             let mut out = std::ptr::null_mut();
             let qi: QiFn = std::mem::transmute(*(vt(dummy)));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt(dummy).add(2));
             assert_eq!(qi(dummy, &std::mem::zeroed(), &mut out), E_NOINTERFACE);
             assert!(out.is_null());
+            let to_crate_guid = |g: windows::core::GUID| GUID {
+                data1: g.data1,
+                data2: g.data2,
+                data3: g.data3,
+                data4: g.data4,
+            };
+            for base_iid in [
+                to_crate_guid(windows::core::IUnknown::IID),
+                to_crate_guid(ID3D12Object::IID),
+                to_crate_guid(ID3D12DeviceChild::IID),
+            ] {
+                out = std::ptr::null_mut();
+                assert_eq!(qi(dummy, &base_iid, &mut out), S_OK);
+                assert_eq!(out, dummy);
+                assert_eq!(release(dummy), 1);
+            }
             let iid = super::super::device_x::IID_SHADER_CACHE_SESSION;
             assert_eq!(qi(dummy, &iid, &mut out), S_OK);
             assert_eq!(out, dummy);
 
             // 2. AddRef / Release
             let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt(dummy).add(1));
-            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt(dummy).add(2));
             assert_eq!(add_ref(dummy), 3);
             assert_eq!(release(dummy), 2);
 
-            // 3. FindValue reports a cache miss.
+            // 3. FindValue reports a cache miss and zeroes *val_size when provided.
             let find_value: unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut c_void, *mut u32) -> HRESULT =
                 std::mem::transmute(*vt(dummy).add(8));
             assert_eq!(find_value(dummy, std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut()), CACHE_MISS);
+            let mut probed_size = 0xDEAD_BEEFu32;
+            assert_eq!(find_value(dummy, std::ptr::null(), 0, std::ptr::null_mut(), &mut probed_size), CACHE_MISS);
+            assert_eq!(probed_size, 0);
 
             // 4. StoreValue (S_OK)
             let store_value: unsafe extern "system" fn(*mut c_void, *const c_void, u32, *const c_void, u32) -> HRESULT =
