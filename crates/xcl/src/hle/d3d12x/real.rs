@@ -734,7 +734,19 @@ fn module_of(addr: usize) -> usize {
 
 /// Whether `obj` is an object XCL adopted (its vtable is one of XCL's).
 pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
-    !obj.is_null() && (obj as usize) & (std::mem::align_of::<usize>() - 1) == 0 && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
+    adopted_if_readable(obj, |p| crate::gpu::shader::readable(p as usize, size_of::<usize>()))
+}
+
+/// The caller holds the texture release gate. Under Wine on Mac, the PC resource can
+/// live in native memory even if its vtable came from a PE module. Check the object
+/// itself through Wine's guarded read, then require an XCL vtable.
+pub(super) unsafe fn is_adopted_mac_texture(obj: *mut c_void) -> bool {
+    use windows_sys::Win32::System::Memory::IsBadReadPtr;
+    adopted_if_readable(obj, |p| IsBadReadPtr(p, size_of::<usize>()) == 0)
+}
+
+unsafe fn adopted_if_readable(obj: *mut c_void, readable: impl FnOnce(*mut c_void) -> bool) -> bool {
+    !obj.is_null() && (obj as usize) & (std::mem::align_of::<usize>() - 1) == 0 && readable(obj) && is_ext(*obj.cast::<usize>())
 }
 
 /// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
@@ -5939,6 +5951,9 @@ mod this_first_tests {
         let b = buf.as_ptr() as *mut c_void;
         unsafe {
             assert!(is_adopted(obj) && is_adopted(b), "both look adopted");
+            assert!(is_adopted_mac_texture(obj));
+            assert!(!is_adopted_mac_texture(p), "readable bytes alone do not establish an XCL vtable");
+            assert!(!is_adopted_mac_texture(std::ptr::null_mut()));
             // one adopted: that one is the object, either position
             assert!(this_first(obj, p));
             assert!(!this_first(p, obj));
@@ -5981,6 +5996,7 @@ mod this_first_tests {
             // even with a stale vtable copy at the 4-byte-aligned address, it cannot be a COM object
             (unaligned as *mut usize).write_unaligned(vtbl);
             assert!(!is_adopted(unaligned));
+            assert!(!is_adopted_mac_texture(unaligned));
             assert!(this_first(obj, unaligned));
             assert!(!this_first(unaligned, obj));
             drop(Box::from_raw(obj as *mut [usize; 1]));

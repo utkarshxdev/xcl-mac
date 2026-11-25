@@ -362,7 +362,14 @@ unsafe fn clone_resource(res: usize, mac: bool) -> Option<ID3D12Resource> {
     let borrow = || ID3D12Resource::from_raw_borrowed(&p).cloned();
     if mac {
         with_resource_reference(res, || {
-            if !super::real::is_adopted(p) {
+            if !super::real::is_adopted_mac_texture(p) {
+                if trace_unwatched() {
+                    static REJECTS: AtomicU64 = AtomicU64::new(0);
+                    let n = REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 4 || n.is_power_of_two() {
+                        crate::xlog_info!("title texture trace: reference #{n} rejected for {res:#x}: no readable XCL vtable");
+                    }
+                }
                 return None;
             }
             borrow()
@@ -2019,6 +2026,7 @@ mod tests {
             for value in [0x3D, 0x9A] {
                 std::ptr::write_bytes(src as *mut u8, value, PAGE);
                 refresh(queue.as_raw());
+                assert!(!TEXTURES.lock().unwrap().by_res[&key].pending, "the first upload must leave the pending queue");
                 assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "GPU contents follow CPU writes");
                 assert_eq!(address(key), Some(va), "the title address stays in the GPU view");
             }
