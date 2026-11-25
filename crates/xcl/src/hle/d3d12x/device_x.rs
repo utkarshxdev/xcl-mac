@@ -1258,9 +1258,15 @@ mod tests {
         let graphics10 = GUID::from_u128(ID3D12GraphicsCommandList10::IID.to_u128());
         unsafe {
             assert_eq!(command_list_iid(&unknown, false), (false, &unknown as *const GUID));
-            assert_eq!(command_list_iid(&unknown, true), (false, &IID_GRAPHICS_COMMAND_LIST as *const GUID));
+            let (dma, mapped) = command_list_iid(&unknown, true);
+            assert!(!dma);
+            assert!(!mapped.is_null());
+            assert_eq!(guid_bytes(&mapped.read_unaligned()), guid_bytes(&IID_GRAPHICS_COMMAND_LIST));
             assert_eq!(command_list_iid(&graphics10, true), (false, &graphics10 as *const GUID));
-            assert_eq!(command_list_iid(&IID_XBOX_DMA_COMMAND_LIST, false), (true, &IID_GRAPHICS_COMMAND_LIST as *const GUID));
+            let (dma, mapped) = command_list_iid(&IID_XBOX_DMA_COMMAND_LIST, false);
+            assert!(dma);
+            assert!(!mapped.is_null());
+            assert_eq!(guid_bytes(&mapped.read_unaligned()), guid_bytes(&IID_GRAPHICS_COMMAND_LIST));
             assert_eq!(command_list_iid(std::ptr::null(), true), (false, std::ptr::null()));
         }
     }

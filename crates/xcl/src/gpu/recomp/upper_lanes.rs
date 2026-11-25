@@ -958,6 +958,7 @@ mod tests {
             wl(10, 36, 21),
             wl(3, 7, 22),
             wl(3, 40, 23),
+            WWM, // Activate the upper lanes so the move overwrites the destination shadow.
             ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 8)], None),
             rl(10, 5, 30),
             rl(10, 36, 31),
@@ -979,6 +980,7 @@ mod tests {
             wl(10, 36, 21),
             wl(4, 8, 24),
             wl(4, 42, 25),
+            WWM, // Activate the upper lanes so the move overwrites the destination shadow.
             ("V_MOVRELS_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 8)], None),
             rl(10, 5, 34),
             rl(10, 36, 35),
