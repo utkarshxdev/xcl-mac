@@ -103,6 +103,8 @@ const NO_COMMAND: u32 = 0xFFFF_FFFF;
 const COMMAND_REQUEST: u32 = 0;
 /// ID3D12Fence::Signal
 const FENCE_SIGNAL: usize = 10;
+/// `DSTORAGE_QUEUE_OPTIONS::AutoSubmitDisabled` (bit 0 of the `u64` at `DSTORAGE_QUEUE_DESC1 + 0x18`).
+const QUEUE_OPT_AUTO_SUBMIT_DISABLED: u64 = 1 << 0;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![DStorageGetFactory]
@@ -629,17 +631,26 @@ unsafe extern "system" fn factory_unknown(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
 
-/// Slot 10 of the newer factory: CreateQueue with a 0x20-byte desc – the 0x18 of
-/// `factory_create_queue`, then a u64 (a retail game: 1).
+/// Slot 10 of `IDStorageFactoryX2`: `CreateQueue1` takes `DSTORAGE_QUEUE_DESC1` (0x20 bytes) –
+/// `DSTORAGE_QUEUE_DESC` followed by `DSTORAGE_QUEUE_OPTIONS` at +0x18 (bit 0: `AutoSubmitDisabled`).
 unsafe extern "system" fn factory_create_queue1(p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
-    if !desc.is_null() {
+    let options = if desc.is_null() {
+        0
+    } else {
         let extra = (desc.add(0x18) as *const u64).read_unaligned();
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), u64 @0x18 = {extra:#x}");
+            crate::xlog_info!(
+                "DirectStorage: CreateQueue1 (0x20 desc), options = {extra:#x} (auto_submit_disabled = {})",
+                extra & QUEUE_OPT_AUTO_SUBMIT_DISABLED != 0
+            );
         }
-    }
-    factory_create_queue(p, desc, riid, out)
+        if extra & !QUEUE_OPT_AUTO_SUBMIT_DISABLED != 0 {
+            warn_once("CreateQueue1", format_args!("unknown DSTORAGE_QUEUE_OPTIONS bits {extra:#x}"));
+        }
+        extra
+    };
+    factory_create_queue_with_options(p, desc, options, riid, out)
 }
 
 unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) -> HRESULT {
@@ -1185,6 +1196,7 @@ struct QueueInner {
     desc: [u8; 0x18],
     source_memory: bool,
     capacity: usize,
+    auto_submit_disabled: bool,
     pending: Mutex<Pending>,
     cancels: Mutex<Vec<CancelRule>>,
     worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
@@ -1369,8 +1381,8 @@ impl QueueInner {
             p.entries.push(e);
             p.entries.len()
         };
-        // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
+        // as on PC: a half-full queue submits by itself, unless AutoSubmitDisabled was set in CreateQueue1
+        if !self.auto_submit_disabled && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1386,7 +1398,7 @@ impl QueueInner {
             p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
             p.entries.len()
         };
-        if n >= (self.capacity / 2).max(1) {
+        if !self.auto_submit_disabled && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1422,7 +1434,11 @@ fn queue_vtbl() -> &'static [usize] {
     })
 }
 
-unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn factory_create_queue(p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    factory_create_queue_with_options(p, desc, 0, riid, out)
+}
+
+unsafe fn factory_create_queue_with_options(_p: *mut c_void, desc: *const u8, options: u64, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
@@ -1458,6 +1474,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         desc: raw,
         source_memory: source == 1,
         capacity,
+        auto_submit_disabled: options & QUEUE_OPT_AUTO_SUBMIT_DISABLED != 0,
         pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1 }),
         cancels: Mutex::new(Vec::new()),
         worker: Mutex::new(None),
@@ -1698,7 +1715,7 @@ unsafe extern "system" fn queue_query(p: *mut c_void, out: *mut u8) {
     let q = queue(p);
     let pending = q.pending.lock().unwrap().entries.len();
     let empty = q.capacity.saturating_sub(pending) as u16;
-    let until = (q.capacity / 2).max(1).saturating_sub(pending).max(1) as u16;
+    let until = if q.auto_submit_disabled { u16::MAX } else { (q.capacity / 2).max(1).saturating_sub(pending).max(1) as u16 };
     let mut info = [0u8; 0x1C];
     info[..0x18].copy_from_slice(&q.desc);
     info[0x18..0x1A].copy_from_slice(&empty.to_le_bytes());
@@ -2738,6 +2755,113 @@ mod tests {
             queue_close(q);
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    #[test]
+    fn create_queue1_auto_submit_disabled_waits_for_submit() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+
+            let make_desc1 = |options: u64| {
+                let mut desc = [0u8; 0x20];
+                desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
+                desc[8..10].copy_from_slice(&8u16.to_le_bytes()); // capacity 8 (auto-submit threshold 4)
+                desc[10] = 2; // high priority
+                desc[0x18..0x20].copy_from_slice(&options.to_le_bytes());
+                desc
+            };
+
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue1(f, make_desc1(QUEUE_OPT_AUTO_SUBMIT_DISABLED).as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let enqueue_status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let query_q: unsafe extern "system" fn(*mut c_void, *mut u8) = std::mem::transmute(*qv.add(11));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            let read_info = |queue_ptr: *mut c_void| {
+                let mut info = [0u8; 0x1C];
+                query_q(queue_ptr, info.as_mut_ptr());
+                let empty = u16::from_le_bytes([info[0x18], info[0x19]]);
+                let until = u16::from_le_bytes([info[0x1A], info[0x1B]]);
+                (empty, until)
+            };
+
+            assert_eq!(read_info(q), (8, u16::MAX));
+
+            let mut srcs: Vec<[u8; 32]> = (0..5u8).map(|i| [0x10 + i; 32]).collect();
+            let mut dsts: Vec<[u8; 32]> = vec![[0xCD; 32]; 5];
+            // Enqueue 5 requests + 1 status entry (6 > capacity/2 = 4) without submitting.
+            for (src, dst) in srcs.iter().zip(dsts.iter_mut()) {
+                let r = request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, dst.len() as u32, src.as_ptr() as u64, 0, src.len() as u32);
+                enqueue(q, r.as_ptr());
+            }
+            enqueue_status(q, s, 0);
+
+            assert_eq!(read_info(q), (2, u16::MAX));
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            assert!(!complete(s, 0), "AutoSubmitDisabled must not auto-submit past capacity/2");
+            assert!(dsts.iter().all(|d| d.iter().all(|&b| b == 0xCD)), "destinations remain untouched until Submit()");
+
+            // Mutate a source buffer before Submit() to confirm execution happens only after Submit().
+            srcs[4] = [0x99; 32];
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(complete(s, 0), "explicit Submit() completes the batch");
+            assert_eq!(hresult(s, 0), S_OK);
+            for (i, (src, dst)) in srcs.iter().zip(&dsts).enumerate() {
+                assert_eq!(dst, src, "request {i} destination mismatch");
+            }
+            assert_eq!(read_info(q), (8, u16::MAX));
+
+            // An unsubmitted status entry on an AutoSubmitDisabled queue resolves to E_QUEUE_CLOSED on Close().
+            enqueue_status(q, s, 1);
+            assert!(!complete(s, 1));
+            queue_close(q);
+            assert!(complete(s, 1));
+            assert_eq!(hresult(s, 1), E_QUEUE_CLOSED);
+            queue_release(q);
+            status_release(s);
+
+            // Control: CreateQueue1 with options == 0 still auto-submits at capacity / 2.
+            let mut q_auto = std::ptr::null_mut();
+            assert_eq!(create_queue1(f, make_desc1(0).as_ptr(), &IID_QUEUE, &mut q_auto), S_OK);
+            let mut s_auto = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s_auto), S_OK);
+            assert_eq!(read_info(q_auto), (8, 4));
+
+            let mut auto_dsts = vec![[0xCDu8; 32]; 3];
+            for (src, dst) in srcs[..3].iter().zip(auto_dsts.iter_mut()) {
+                let r = request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, dst.len() as u32, src.as_ptr() as u64, 0, src.len() as u32);
+                enqueue(q_auto, r.as_ptr());
+            }
+            enqueue_status(q_auto, s_auto, 0); // 4th entry == capacity / 2 triggers auto-submit
+            let t = std::time::Instant::now();
+            while !complete(s_auto, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(complete(s_auto, 0), "options == 0 auto-submits at capacity/2");
+            assert_eq!(hresult(s_auto, 0), S_OK);
+            for (i, (src, dst)) in srcs[..3].iter().zip(&auto_dsts).enumerate() {
+                assert_eq!(dst, src, "auto-submitted request {i} destination mismatch");
+            }
+            queue_close(q_auto);
+            queue_release(q_auto);
+            status_release(s_auto);
         }
     }
 }

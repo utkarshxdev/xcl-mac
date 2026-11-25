@@ -57,6 +57,7 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 - **Dual-Source Blending Stand-Ins:** Implements `SV_Target0` + `SV_Target1` stand-in pixel shaders (PR [#666](https://github.com/ivall/xcl/pull/666)), preventing D3DMetal pipeline creation rejections.
 - **Command-List Creation:** Device slot 73 distinguishes shader-cache sessions by their explicit interface IDs. On Mac hosts, console-only command-list IDs are translated to the standard PC graphics command-list interface.
 - **Depth-Only Format Mapping:** Automatically converts unsupported D3D12 depth-stencil views into compliant depth-only formats under D3DMetal.
+- **Mesh Shader Pipelines:** XCL translates console mesh shaders supplied in the amplification slot and splits large mesh outputs to fit D3D12 limits.
 - **Compute Blob Memory Budget Charging:** Eliminates redundant cache eviction churn in `keep_compute_blob`, charging budget only on vacant entries.
 
 ### 3. Unified Memory Architecture (UMA) Fast Paths
@@ -68,7 +69,7 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 ### 4. Wine & CrossOver Stability
 - **XGameRuntime fallback** uses XCL's built-in async and accessibility APIs if the host runtime cannot initialize or provide its XAsync interface. That backend choice stays in place for the lifetime of the process.
 - **Isolated DXC Thread Heaps (`own_heaps`):** Allocates private heap spaces for parallel DXC shader compilation threads, eliminating concurrency crashes in Wine's memory manager.
-- **DirectStorage BCPack:** Decodes BC1, BC3, BC4, BC5, BC6H, and BC7 requests using the upstream XCL decoder.
+- **DirectStorage:** Decodes BC1, BC3, BC4, BC5, BC6H, and BC7 requests using the upstream XCL decoder. Queues created with `AutoSubmitDisabled` wait for the title to submit their requests.
 - **Default Network Isolation (`netoff.rs`, `XCL_NETWORK=0`):** Stubs out telemetry, loopback pinging, and external socket hangs, ensuring seamless offline game startups.
 
 ---
