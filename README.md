@@ -55,13 +55,14 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 ### 2. Apple D3DMetal & MetalFX Integration
 - **COM Vtable Prefix Mirroring (`PREFIX = 16`):** D3DMetal retrieves internal Metal encoders at negative offsets (`ext - 16`). Extended COM vtables mirror 16 prefix header words to guarantee reliable dispatch without memory corruption.
 - **Dual-Source Blending Stand-Ins:** Implements `SV_Target0` + `SV_Target1` stand-in pixel shaders (PR [#666](https://github.com/ivall/xcl/pull/666)), preventing D3DMetal pipeline creation rejections.
+- **Command-List Creation:** Device slot 73 distinguishes shader-cache sessions by their explicit interface IDs. On Mac hosts, console-only command-list IDs are translated to the standard PC graphics command-list interface.
 - **Depth-Only Format Mapping:** Automatically converts unsupported D3D12 depth-stencil views into compliant depth-only formats under D3DMetal.
 - **Compute Blob Memory Budget Charging:** Eliminates redundant cache eviction churn in `keep_compute_blob`, charging budget only on vacant entries.
 
 ### 3. Unified Memory Architecture (UMA) Fast Paths
 - **UMA Video Memory Shadowing (`Uma::shadowed`):** Emulates console shared memory without requiring `OpenExistingHeapFromAddress` (unsupported by Wine), enabling high-speed zero-copy CPU-to-GPU data flow.
 - **Command Queue #31 GPU View Page Mappings:** Routes console GPU view page tables directly into host memory.
-- **Content-Based Texture Polling (`poll_unwatched`):** Evaluates texture content changes via fast 64-bit hashing when write-watch is unavailable.
+- **Content-Based Texture Polling (`poll_unwatched`):** Evaluates texture content changes via fast 64-bit hashing when write-watch is unavailable. Uploads skip textures while their host resources are being released.
 - **Unchanged Texture Upload Skip (`XCL_TEXTURE_SKIP_UNCHANGED=1`):** Skips redundant GPU buffer re-uploads, saving precious PCIe/UMA bandwidth.
 
 ### 4. Wine & CrossOver Stability

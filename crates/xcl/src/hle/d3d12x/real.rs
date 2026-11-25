@@ -1701,6 +1701,8 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 }
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+    let mac = crate::util::mac_host();
+    let _releasing = mac.then(|| super::title_textures::ResourceRelease::begin(this as usize));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     // The last reference: kept until the queues are past the work in flight (`late_release`).
     // (Two last-but-one releases at once can miss each other here; the object then goes at
@@ -1720,7 +1722,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     // Keep the backing and its pins alive together with the resource on D3DMetal.
-    if n == 0 && !(held && crate::util::mac_host()) {
+    if n == 0 && !(held && mac) {
         forget_resource(this as usize);
     }
     if held {
@@ -1730,6 +1732,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
 }
 
 pub(super) unsafe fn release_held_resource(this: *mut c_void, mac: bool) {
+    let _releasing = mac.then(|| super::title_textures::ResourceRelease::begin(this as usize));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     if f(this) == 0 && mac {
         forget_resource(this as usize);

@@ -320,6 +320,55 @@ fn adjust_pending(delta: isize) {
     }
 }
 
+// Both immediate and deferred releases can reach the host before `forget` takes TEXTURES.
+static RELEASING: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+pub(super) struct ResourceRelease(usize);
+
+impl ResourceRelease {
+    pub(super) fn begin(res: usize) -> Self {
+        *RELEASING.lock().unwrap().entry(res).or_default() += 1;
+        Self(res)
+    }
+}
+
+impl Drop for ResourceRelease {
+    fn drop(&mut self) {
+        let mut releasing = RELEASING.lock().unwrap();
+        let count = releasing.get_mut(&self.0).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            releasing.remove(&self.0);
+        }
+    }
+}
+
+fn with_resource_reference<T>(res: usize, add_ref: impl FnOnce() -> Option<T>) -> Option<T> {
+    let releasing = RELEASING.lock().unwrap();
+    if releasing.contains_key(&res) {
+        return None;
+    }
+    // Keep the release gate through AddRef. Native Release and cleanup run outside it.
+    add_ref()
+}
+
+/// Acquire an owned reference while the caller holds TEXTURES. A release already in
+/// progress can have destroyed the object even though its tracking entry is still present.
+unsafe fn clone_resource(res: usize, mac: bool) -> Option<ID3D12Resource> {
+    let p = res as *mut c_void;
+    let borrow = || ID3D12Resource::from_raw_borrowed(&p).cloned();
+    if mac {
+        with_resource_reference(res, || {
+            if !super::real::is_adopted(p) {
+                return None;
+            }
+            borrow()
+        })
+    } else {
+        borrow()
+    }
+}
+
 unsafe fn clone_resources(ptrs: &[usize]) -> Vec<ID3D12Resource> {
     ptrs.iter()
         .filter_map(|&raw| {
@@ -829,6 +878,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
             })
             .filter_map(|(&res, e)| {
+                // A pending unwatched texture can retry next submit if a Release is in flight.
+                let r = clone_resource(res, on_mac && e.unwatched)?;
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
@@ -837,9 +888,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
                         e.sent = memory_hash(e.va, e.tex.size() as usize);
                     }
                 }
-                let p = res as *mut c_void;
                 let source = if on_mac { e.va } else { e.src };
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, source, Arc::clone(&e.tex), e.states.clone())))
+                Some((r, (e.device, source, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
@@ -1158,12 +1208,11 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
             if e.seq != seq || !e.unwatched || e.pending || e.gpu_written {
                 return None;
             }
+            let r = clone_resource(res, true)?;
             e.sent = h;
             e.changed = frame;
             e.dynamic = true;
             let k = CHANGED.fetch_add(1, Ordering::Relaxed);
-            let p = res as *mut c_void;
-            let r = ID3D12Resource::from_raw_borrowed(&p)?.clone();
             if trace_unwatched() && (k < 600 || k.is_power_of_two()) {
                 let d = r.GetDesc();
                 crate::xlog_info!("title texture trace: content of the texture at {:#x} ({}x{} format {}, {} bytes) changed – upload #{k}, frame {frame}", e.va, d.Width, d.Height, d.Format.0, e.tex.size());
@@ -1738,6 +1787,25 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploads_do_not_acquire_references_during_resource_release() {
+        let res = 0x5445_5800usize;
+        let other = res + 8;
+        assert_eq!(with_resource_reference(res, || {
+            assert!(matches!(RELEASING.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            Some(1)
+        }), Some(1));
+        let title = ResourceRelease::begin(res);
+        let worker = ResourceRelease::begin(res);
+        let reject = || with_resource_reference::<()>(res, || panic!("AddRef during Release"));
+        assert_eq!(reject(), None);
+        assert_eq!(with_resource_reference(other, || Some(2)), Some(2));
+        drop(title);
+        assert_eq!(reject(), None);
+        drop(worker);
+        assert_eq!(with_resource_reference(res, || Some(3)), Some(3));
+    }
 
     /// A texture is left out only when its memory hashes as at its own last upload, and a
     /// texture that was forgotten (released, or its address registered again) is uploaded again.

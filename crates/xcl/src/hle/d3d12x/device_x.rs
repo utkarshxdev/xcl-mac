@@ -42,12 +42,14 @@ pub const IID_SHADER_CACHE_SESSION1: GUID = GUID::from_u128(0x1c5789ff_9203_490f
 const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
 const IID_DEVICE_CHILD: GUID = GUID::from_u128(0x905db94b_a00c_4140_9df5_2b64ca9ea357);
 
-pub fn is_shader_cache_session_guid(g: &GUID) -> bool {
+fn is_shader_cache_creation_guid(g: &GUID) -> bool {
     let b = guid_bytes(g);
-    b == guid_bytes(&IID_SHADER_CACHE_SESSION)
-        || b == guid_bytes(&IID_SHADER_CACHE_SESSION1)
-        || b == guid_bytes(&IID_IUNKNOWN)
-        || b == guid_bytes(&IID_DEVICE_CHILD)
+    b == guid_bytes(&IID_SHADER_CACHE_SESSION) || b == guid_bytes(&IID_SHADER_CACHE_SESSION1)
+}
+
+pub fn is_shader_cache_session_guid(g: &GUID) -> bool {
+    is_shader_cache_creation_guid(g) || guid_bytes(g) == guid_bytes(&IID_IUNKNOWN)
+        || guid_bytes(g) == guid_bytes(&IID_DEVICE_CHILD)
 }
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
 const XBOX_ARG_DISPATCH_X: u32 = 105;
@@ -101,9 +103,45 @@ pub(super) unsafe extern "system" fn create_command_allocator_x(this: *mut c_voi
     real::dev_create_command_allocator(this, pc_list_type(ty) as usize, riid, ppv)
 }
 
+fn is_pc_command_list_guid(g: &GUID) -> bool {
+    const PC_IIDS: &[windows::core::GUID] = &[
+        windows::core::IUnknown::IID,
+        ID3D12Object::IID,
+        ID3D12DeviceChild::IID,
+        ID3D12CommandList::IID,
+        ID3D12GraphicsCommandList::IID,
+        ID3D12GraphicsCommandList1::IID,
+        ID3D12GraphicsCommandList2::IID,
+        ID3D12GraphicsCommandList3::IID,
+        ID3D12GraphicsCommandList4::IID,
+        ID3D12GraphicsCommandList5::IID,
+        ID3D12GraphicsCommandList6::IID,
+        ID3D12GraphicsCommandList7::IID,
+        ID3D12GraphicsCommandList8::IID,
+        ID3D12GraphicsCommandList9::IID,
+        ID3D12GraphicsCommandList10::IID,
+    ];
+    let g = windows::core::GUID::from_values(g.data1, g.data2, g.data3, g.data4);
+    PC_IIDS.contains(&g)
+}
+
+unsafe fn command_list_iid(riid: *const GUID, mac: bool) -> (bool, *const GUID) {
+    if riid.is_null() {
+        return (false, riid);
+    }
+    let requested = riid.read_unaligned();
+    let dma = guid_bytes(&requested) == guid_bytes(&IID_XBOX_DMA_COMMAND_LIST);
+    // D3DMetal can reject console-only IIDs with E_INVALIDARG, before the usual
+    // E_NOINTERFACE fallback. Keep explicitly requested PC interfaces intact.
+    if dma || (mac && !is_pc_command_list_guid(&requested)) {
+        (dma, &IID_GRAPHICS_COMMAND_LIST)
+    } else {
+        (dma, riid)
+    }
+}
+
 unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let dma = !riid.is_null() && guid_bytes(&*riid) == guid_bytes(&IID_XBOX_DMA_COMMAND_LIST);
-    let riid = if dma { &IID_GRAPHICS_COMMAND_LIST as *const GUID } else { riid };
+    let (dma, riid) = command_list_iid(riid, crate::util::mac_host());
     let (node, ty) = (if node == 0 { 0 } else { 1 }, pc_list_type(ty) as usize);
     let hr = if super::console_list::enabled() {
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
@@ -139,16 +177,28 @@ pub(super) unsafe extern "system" fn create_command_list_pc(this: *mut c_void, n
 /// device #73 CreateCommandListX(params { type @0; node mask @8 }, allocator, initial
 /// pipeline, riid, list)
 pub(super) unsafe extern "system" fn create_command_list_x(this: *mut c_void, params: *const u32, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    // This slot also receives PC cache-session calls from some titles. An allocator and
-    // a PSO are readable too, so require the cache call's IID before writing its output.
-    if alloc != 0 && crate::gpu::shader::readable(alloc, std::mem::size_of::<GUID>()) {
-        let candidate = (alloc as *const GUID).read_unaligned();
-        if is_shader_cache_session_guid(&candidate) {
-            return create_shader_cache_session_x(this, params as *const c_void, alloc as *const GUID, pso as *mut *mut c_void);
-        }
+    dispatch_command_list_x(
+        params, alloc, pso,
+        |desc, iid, out| create_shader_cache_session_x(this, desc, iid, out),
+        |node, ty, allocator, pipeline| create_list(this, node, ty, allocator, pipeline, riid, ppv),
+    )
+}
+
+unsafe fn dispatch_command_list_x(
+    params: *const u32,
+    alloc: usize,
+    pso: usize,
+    create_cache: impl FnOnce(*const c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    create_list: impl FnOnce(u32, u32, usize, usize) -> HRESULT,
+) -> HRESULT {
+    // The cache overload needs an explicit session IID. Base COM IIDs are valid for
+    // QueryInterface but cannot distinguish an allocator from the cache call's REFIID.
+    let iid = alloc as *const GUID;
+    if crate::gpu::shader::readable(alloc, std::mem::size_of::<GUID>()) && is_shader_cache_creation_guid(&iid.read_unaligned()) {
+        return create_cache(params.cast(), iid, pso as *mut *mut c_void);
     }
     let (ty, node) = if params.is_null() { (0, 1) } else { (params.read_unaligned(), params.add(2).read_unaligned()) };
-    create_list(this, node, ty, alloc, pso, riid, ppv)
+    create_list(node, ty, alloc, pso)
 }
 
 /// device #73 CreateShaderCacheSession (PC path / ID3D12Device9)
@@ -1162,6 +1212,58 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_73_preserves_a_null_initial_pipeline_for_command_lists() {
+        let params = [2, 0, 1];
+        for iid in [IID_IUNKNOWN, IID_DEVICE_CHILD, IID_GRAPHICS_COMMAND_LIST, GUID::from_u128(0)] {
+            let allocator = &iid as *const GUID as usize;
+            let hr = unsafe {
+                dispatch_command_list_x(params.as_ptr(), allocator, 0,
+                    |_, _, _| panic!("base or unrelated IID routed to shader cache"),
+                    |node, ty, alloc, pso| {
+                        assert_eq!((node, ty, alloc, pso), (1, 2, allocator, 0));
+                        S_OK
+                    },
+                )
+            };
+            assert_eq!(hr, S_OK);
+        }
+    }
+
+    #[test]
+    fn slot_73_routes_explicit_shader_cache_session_iids() {
+        let desc = D3D12_SHADER_CACHE_SESSION_DESC::default();
+        let params = (&desc as *const D3D12_SHADER_CACHE_SESSION_DESC).cast::<u32>();
+        let mut out = std::ptr::null_mut::<c_void>();
+        let output = &mut out as *mut *mut c_void;
+        for iid in [IID_SHADER_CACHE_SESSION, IID_SHADER_CACHE_SESSION1] {
+            let expected = &iid as *const GUID;
+            let hr = unsafe {
+                dispatch_command_list_x(params, expected as usize, output as usize,
+                    |desc, iid, out| {
+                        assert_eq!((desc, iid, out), (params.cast(), expected, output));
+                        S_OK
+                    },
+                    |_, _, _, _| panic!("shader cache IID routed to command list creation"),
+                )
+            };
+            assert_eq!(hr, S_OK);
+        }
+    }
+
+    #[test]
+    fn mac_command_list_iid_mapping_preserves_pc_interfaces() {
+        let unknown = GUID::from_u128(0x4c0cbaed_6d90_41ae_9d19_aba1c977fa3a);
+        let graphics10 = GUID::from_u128(ID3D12GraphicsCommandList10::IID.to_u128());
+        unsafe {
+            assert_eq!(command_list_iid(&unknown, false), (false, &unknown as *const GUID));
+            assert_eq!(command_list_iid(&unknown, true), (false, &IID_GRAPHICS_COMMAND_LIST as *const GUID));
+            assert_eq!(command_list_iid(&graphics10, true), (false, &graphics10 as *const GUID));
+            assert_eq!(command_list_iid(&IID_XBOX_DMA_COMMAND_LIST, false), (true, &IID_GRAPHICS_COMMAND_LIST as *const GUID));
+            assert_eq!(command_list_iid(std::ptr::null(), true), (false, std::ptr::null()));
+        }
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {
