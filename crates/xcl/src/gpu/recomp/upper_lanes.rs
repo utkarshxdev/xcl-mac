@@ -569,7 +569,7 @@ fn step(d: &Decoded, st: &mut State) {
                 st.lo.remove(&v);
             }
         }
-    } else if name.starts_with("V_MOVREL") || name.starts_with("V_SWAPREL") {
+    } else if (name.starts_with("V_MOVREL") && name != "V_MOVRELS_B32") || name.starts_with("V_SWAPREL") {
         // writes v[dst + m0] (v_swaprel also v[src0 + m0]): any VGPR
         st.lo.clear();
         if exec_hi != Word::Zero {
@@ -934,6 +934,84 @@ mod tests {
             ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
         ]);
         assert!(!r.contains(&Read::Shadow), "{r:?}");
+    }
+
+    #[test]
+    fn movrels_preserves_unrelated_spill_shadows() {
+        // v_movrels_b32 reads v[src0 + m0] and writes only its fixed vdst:
+        // - spill slots in unrelated registers (v10) are kept past it (lower and upper)
+        // - spill slots in its destination register (v3 / v4) are invalidated
+        // Tests both VOP1 and VOP3 encodings
+        let wl = |reg: u64, lane: u64, s: u64| -> I {
+            let f: &'static [(&'static str, u64)] = Box::leak(vec![("VDST", reg), ("SRC0", s), ("SRC1", 128 + lane)].into_boxed_slice());
+            ("V_WRITELANE_B32", "ENC_VOP3", f, None)
+        };
+        let rl = |reg: u64, lane: u64, sdst: u64| -> I {
+            let f: &'static [(&'static str, u64)] = Box::leak(vec![("VDST", sdst), ("SRC0", V + reg), ("SRC1", 128 + lane)].into_boxed_slice());
+            ("V_READLANE_B32", "ENC_VOP3", f, None)
+        };
+
+        // 1. VOP1 encoding
+        let p_vop1 = program(&[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 128 + 2)], None),
+            wl(10, 5, 20),
+            wl(10, 36, 21),
+            wl(3, 7, 22),
+            wl(3, 40, 23),
+            ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 8)], None),
+            rl(10, 5, 30),
+            rl(10, 36, 31),
+            rl(3, 7, 32),
+            rl(3, 40, 33),
+        ]);
+        let a_vop1 = analyze(&p_vop1);
+        let r_vop1: Vec<Read> = p_vop1.iter().filter_map(|d| a_vop1.reads.get(&d.pc).copied()).collect();
+        assert_eq!(r_vop1, vec![Read::Shadow, Read::Shadow, Read::Unknown]);
+        assert!(a_vop1.shadows.contains(&(10, 5)));
+        assert!(a_vop1.shadows.contains(&(10, 36)));
+        assert!(!a_vop1.shadows.contains(&(3, 7)));
+        assert!(!a_vop1.shadows.contains(&(3, 40)));
+
+        // 2. VOP3 encoding
+        let p_vop3 = program(&[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 128 + 2)], None),
+            wl(10, 5, 20),
+            wl(10, 36, 21),
+            wl(4, 8, 24),
+            wl(4, 42, 25),
+            ("V_MOVRELS_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 8)], None),
+            rl(10, 5, 34),
+            rl(10, 36, 35),
+            rl(4, 8, 36),
+            rl(4, 42, 37),
+        ]);
+        let a_vop3 = analyze(&p_vop3);
+        let r_vop3: Vec<Read> = p_vop3.iter().filter_map(|d| a_vop3.reads.get(&d.pc).copied()).collect();
+        assert_eq!(r_vop3, vec![Read::Shadow, Read::Shadow, Read::Unknown]);
+        assert!(a_vop3.shadows.contains(&(10, 5)));
+        assert!(a_vop3.shadows.contains(&(10, 36)));
+        assert!(!a_vop3.shadows.contains(&(4, 8)));
+        assert!(!a_vop3.shadows.contains(&(4, 42)));
+    }
+
+    #[test]
+    fn relative_writes_invalidate_spill_shadows() {
+        // Relative writes (V_MOVRELD_B32, V_MOVRELSD_2_B32) write v[dst + m0] and conservatively invalidate all spill shadows
+        let r_reld = reads(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 128 + 2)], None),
+            ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 8)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ]);
+        assert!(!r_reld.contains(&Read::Shadow), "V_MOVRELD must invalidate spill shadows: {r_reld:?}");
+
+        let r_relsd2 = reads(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 128 + 2)], None),
+            ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 8)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ]);
+        assert!(!r_relsd2.contains(&Read::Shadow), "V_MOVRELSD_2 must invalidate spill shadows: {r_relsd2:?}");
     }
 
     #[test]
