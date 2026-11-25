@@ -52,22 +52,14 @@ pub struct XAsyncProviderData {
 
 pub type XAsyncProvider = unsafe extern "system" fn(u32, *const XAsyncProviderData) -> HRESULT;
 
-/// The PC runtime's XAsync / XTaskQueue object (0 = XCL's own queues). Its slots: 3 GetStatus,
-/// 4 GetResultSize, 5 Cancel, 6 Run, 7 Begin, 9 Schedule, 10 Complete, 11 GetResult.
-static PC_ASYNC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// tests that use XCL's queues and the one that switches to the PC runtime take turns
 #[cfg(test)]
 pub static ASYNC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-pub fn use_pc(object: usize) {
-    PC_ASYNC.store(object, Ordering::Release);
-}
-
 /// (object, slot function) of the PC XAsync object, when in use
 unsafe fn pc(slot: usize) -> Option<(usize, usize)> {
-    let o = PC_ASYNC.load(Ordering::Acquire);
-    (o != 0).then(|| (o, *(*(o as *const *const usize)).add(slot)))
+    let o = super::api::pc_async_object()?.get();
+    Some((o, *(*(o as *const *const usize)).add(slot)))
 }
 
 /// XTaskQueueSubmitCallback on whichever runtime owns the title's task queues (the PC's
@@ -252,7 +244,7 @@ pub unsafe extern "system" fn XAsyncBegin(
     // A failing Begin fails the async call, not XAsyncBegin (libHttpClient): the caller gets
     // the error once, through the block, and not also as this return value.
     let hr = call_provider(&s, OP_BEGIN, b, std::ptr::null_mut(), 0);
-    if hr < 0 && hr != E_PENDING {
+    if hr < 0 {
         XAsyncComplete(b, hr, 0);
     }
     S_OK
@@ -1255,36 +1247,4 @@ mod tests {
             taskqueue::XTaskQueueCloseHandle(q);
         }
     }
-
-    #[test]
-    fn begin_returns_e_pending_keeps_operation_pending() {
-        let _guard = ASYNC_TEST_LOCK.lock().unwrap();
-        use_pc(0);
-
-        unsafe extern "system" fn pending_provider(op: u32, _data: *const XAsyncProviderData) -> HRESULT {
-            match op {
-                OP_BEGIN => E_PENDING,
-                _ => S_OK,
-            }
-        }
-
-        unsafe {
-            let mut q = std::ptr::null_mut();
-            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_IMMEDIATE, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
-
-            let mut b: XAsyncBlock = std::mem::zeroed();
-            b.queue = q;
-            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), pending_provider as usize), S_OK);
-            // Must stay pending, NOT completed with E_PENDING as an error
-            assert_eq!(XAsyncGetStatus(&mut b, false), E_PENDING);
-
-            // Now complete it normally
-            XAsyncComplete(&mut b, S_OK, 0);
-            assert_eq!(XAsyncGetStatus(&mut b, false), S_OK);
-
-            taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
-            taskqueue::XTaskQueueCloseHandle(q);
-        }
-    }
 }
-

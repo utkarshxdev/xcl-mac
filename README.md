@@ -66,6 +66,7 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 - **Unchanged Texture Upload Skip (`XCL_TEXTURE_SKIP_UNCHANGED=1`):** Skips redundant GPU buffer re-uploads, saving precious PCIe/UMA bandwidth.
 
 ### 4. Wine & CrossOver Stability
+- **XGameRuntime fallback** uses XCL's built-in async and accessibility APIs if the host runtime cannot initialize or provide its XAsync interface. That backend choice stays in place for the lifetime of the process.
 - **Isolated DXC Thread Heaps (`own_heaps`):** Allocates private heap spaces for parallel DXC shader compilation threads, eliminating concurrency crashes in Wine's memory manager.
 - **Default Network Isolation (`netoff.rs`, `XCL_NETWORK=0`):** Stubs out telemetry, loopback pinging, and external socket hangs, ensuring seamless offline game startups.
 

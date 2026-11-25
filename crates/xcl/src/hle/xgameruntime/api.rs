@@ -13,9 +13,9 @@
 //! else to the PC's own XGameRuntime (`System32\xgameruntime.dll`: the same classes under the
 //! same GUIDs) – XTaskQueue / XAsync, XThread, XGameInvite… (XNetworking is always XCL's). Once
 //! the PC runtime is in use, the queues and async blocks are its own, so XCL's async APIs run on
-//! its XAsync (`xasync::use_pc`); without `System32\xgameruntime.dll`, XAsync / XTaskQueue /
-//! XThread fall back to XCL's own. Nothing that takes an XCL user handle goes to the PC runtime: it does not
-//! validate foreign handles.
+//! its XAsync. If the host runtime is unavailable at startup, XAsync / XTaskQueue / XThread
+//! use XCL's implementation for the process lifetime. Nothing that takes an XCL user handle
+//! goes to the PC runtime: it does not validate foreign handles.
 //!
 //! Layout: `gdk_table` (extracted from the public PC GDK's thunk library) gives every
 //! function's (class, interface, slot); XCL's objects are built from it by
@@ -30,7 +30,8 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::gamesave::*;
@@ -120,15 +121,15 @@ const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 // the PC runtime
 // ---------------------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
+#[derive(Clone, Copy)]
 enum RuntimeChoice {
-    Undecided = 0,
-    Pc = 1,
-    Xcl = 2,
+    Undecided,
+    Initializing,
+    Pc { runtime: &'static Pc, async_object: NonZeroUsize },
+    Xcl(&'static str),
 }
 
-static RUNTIME_CHOICE: AtomicU8 = AtomicU8::new(RuntimeChoice::Undecided as u8);
+static RUNTIME_CHOICE: Mutex<RuntimeChoice> = Mutex::new(RuntimeChoice::Undecided);
 
 type QueryFn = unsafe extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> HRESULT;
 type InitEx2 = unsafe extern "system" fn(u64, u64, u64, *mut c_void) -> HRESULT;
@@ -143,19 +144,56 @@ struct Pc {
     uninit: Option<unsafe extern "system" fn()>,
 }
 
+impl Pc {
+    unsafe fn initialize(&self, gdk: u64, os: u64, flags: u64, options: *mut c_void) -> HRESULT {
+        let mut hr = self.init_ex2.map_or(E_NOTIMPL, |f| f(gdk, os, flags, options));
+        if hr < 0 {
+            if let Some(f) = self.init_ex {
+                hr = f(gdk, os, flags);
+            }
+        }
+        if hr < 0 {
+            if let Some(f) = self.init {
+                hr = f(gdk >> 32, gdk & 0xFFFF_FFFF);
+            }
+        }
+        hr
+    }
+
+    unsafe fn object(&self, c: &Guid, i: &Guid) -> Option<NonZeroUsize> {
+        let mut out = std::ptr::null_mut();
+        if (self.query)(c, i, &mut out) < 0 {
+            return None;
+        }
+        NonZeroUsize::new(out as usize)
+    }
+
+    unsafe fn uninitialize(&self) {
+        if let Some(f) = self.uninit {
+            f();
+        }
+    }
+}
+
 static PC: OnceLock<Option<Pc>> = OnceLock::new();
 
 #[cfg(test)]
-static PC_TEST_OVERRIDE: Mutex<Option<&'static Pc>> = Mutex::new(None);
-
-#[cfg(test)]
-unsafe fn set_pc_for_test(override_pc: Option<&'static Pc>) {
-    *PC_TEST_OVERRIDE.lock().unwrap() = override_pc;
+thread_local! {
+    static PC_TEST_OVERRIDE: std::cell::Cell<Option<&'static Pc>> = const { std::cell::Cell::new(None) };
+    static TEST_RUNTIME_CHOICE: Mutex<RuntimeChoice> = const { Mutex::new(RuntimeChoice::Undecided) };
 }
 
-fn pc() -> Option<&'static Pc> {
+fn with_runtime_choice<T>(f: impl FnOnce(&mut RuntimeChoice) -> T) -> T {
     #[cfg(test)]
-    if let Some(p) = *PC_TEST_OVERRIDE.lock().unwrap() {
+    if PC_TEST_OVERRIDE.get().is_some() {
+        return TEST_RUNTIME_CHOICE.with(|choice| f(&mut choice.lock().unwrap()));
+    }
+    f(&mut RUNTIME_CHOICE.lock().unwrap())
+}
+
+fn load_pc() -> Option<&'static Pc> {
+    #[cfg(test)]
+    if let Some(p) = PC_TEST_OVERRIDE.get() {
         return Some(p);
     }
     PC.get_or_init(|| unsafe {
@@ -167,7 +205,6 @@ fn pc() -> Option<&'static Pc> {
         }
         let f = |n: &str| GetProcAddress(h, format!("{n}\0").as_ptr()).map(|p| p as usize);
         let query = f("QueryApiImpl")?;
-        crate::xlog_info!("XGameRuntime: APIs XCL does not implement come from the system xgameruntime.dll");
         Some(Pc {
             query: std::mem::transmute::<usize, QueryFn>(query),
             init_ex2: f("InitializeApiImplEx2").map(|p| std::mem::transmute::<usize, InitEx2>(p)),
@@ -180,17 +217,27 @@ fn pc() -> Option<&'static Pc> {
 }
 
 unsafe fn pc_object(c: &Guid, i: &Guid) -> Option<usize> {
-    if *c == XASYNC && RUNTIME_CHOICE.load(Ordering::Acquire) != RuntimeChoice::Pc as u8 {
-        return None;
+    match with_runtime_choice(|choice| *choice) {
+        RuntimeChoice::Pc { runtime, .. } => runtime.object(c, i).map(NonZeroUsize::get),
+        _ => None,
     }
-    let mut o: *mut c_void = std::ptr::null_mut();
-    ((pc()?.query)(c, i, &mut o) >= 0 && !o.is_null()).then_some(o as usize)
 }
 
-/// After the PC runtime is initialised: XCL's async APIs on its XAsync.
-unsafe fn start_pc_async() {
-    if let Some(o) = pc_object(&XASYNC, &XASYNC) {
-        super::xasync::use_pc(o);
+fn async_runtime() -> RuntimeChoice {
+    with_runtime_choice(|choice| {
+        // A caller can start using XCL queues while native initialization re-enters XCL.
+        // Honor that choice for the rest of the process.
+        if matches!(*choice, RuntimeChoice::Undecided | RuntimeChoice::Initializing) {
+            *choice = RuntimeChoice::Xcl("XAsync used before PC initialization completed");
+        }
+        *choice
+    })
+}
+
+pub(super) fn pc_async_object() -> Option<NonZeroUsize> {
+    match async_runtime() {
+        RuntimeChoice::Pc { async_object, .. } => Some(async_object),
+        _ => None,
     }
 }
 
@@ -207,32 +254,53 @@ pub unsafe extern "system" fn InitializeApiImplEx2(gdk: u64, os: u64, flags: u64
 /// Initialise the PC runtime with the title's versions; options this PC runtime does not know
 /// (newer GDK) fall back to the older entry points.
 unsafe fn pc_init(gdk: u64, os: u64, flags: u64, options: *mut c_void) {
-    if RUNTIME_CHOICE.load(Ordering::Acquire) == RuntimeChoice::Xcl as u8 {
-        crate::xlog_info!("XGameRuntime: startup already selected XCL fallback – keeping built-in queues");
+    let claimed = with_runtime_choice(|choice| {
+        if matches!(*choice, RuntimeChoice::Undecided) {
+            *choice = RuntimeChoice::Initializing;
+            true
+        } else {
+            false
+        }
+    });
+    if !claimed {
         return;
     }
-    let Some(p) = pc() else {
-        RUNTIME_CHOICE.store(RuntimeChoice::Xcl as u8, Ordering::Release);
-        return;
+
+    // The DLL can call back into XCL from any of these entry points.
+    let candidate = prepare_pc(gdk, os, flags, options);
+    let installed = with_runtime_choice(|choice| {
+        if matches!(*choice, RuntimeChoice::Initializing) {
+            *choice = candidate;
+            true
+        } else {
+            false
+        }
+    });
+    if let RuntimeChoice::Pc { runtime, .. } = candidate {
+        if installed {
+            crate::xlog_info!("XGameRuntime: APIs XCL does not implement come from the system xgameruntime.dll");
+        } else {
+            runtime.uninitialize();
+        }
+    }
+}
+
+unsafe fn prepare_pc(gdk: u64, os: u64, flags: u64, options: *mut c_void) -> RuntimeChoice {
+    let Some(runtime) = load_pc() else {
+        return RuntimeChoice::Xcl("no system xgameruntime.dll");
     };
-    let mut hr = p.init_ex2.map(|f| f(gdk, os, flags, options)).unwrap_or(-1);
-    if hr < 0 {
-        if let Some(f) = p.init_ex {
-            hr = f(gdk, os, flags);
-        }
-    }
-    if hr < 0 {
-        if let Some(f) = p.init {
-            hr = f(gdk >> 32, gdk & 0xFFFF_FFFF);
-        }
-    }
+    let hr = runtime.initialize(gdk, os, flags, options);
     if hr < 0 {
         crate::xlog_warn!("XGameRuntime PC: initialization → {:#x} – using XCL built-in async fallback", hr as u32);
-        RUNTIME_CHOICE.store(RuntimeChoice::Xcl as u8, Ordering::Release);
-        return;
+        return RuntimeChoice::Xcl("PC initialization failed");
     }
-    RUNTIME_CHOICE.store(RuntimeChoice::Pc as u8, Ordering::Release);
-    start_pc_async();
+
+    let Some(async_object) = runtime.object(&XASYNC, &XASYNC) else {
+        runtime.uninitialize();
+        crate::xlog_warn!("XGameRuntime PC: no usable XAsync object – using XCL built-in async fallback");
+        return RuntimeChoice::Xcl("PC XAsync unavailable");
+    };
+    RuntimeChoice::Pc { runtime, async_object }
 }
 
 pub unsafe extern "system" fn InitializeApiImplEx(gdk: u64, os: u64, flags: u64) -> HRESULT {
@@ -248,9 +316,8 @@ pub unsafe extern "system" fn InitializeApiImpl(gdk: u64, os: u64) -> HRESULT {
 }
 
 pub unsafe extern "system" fn UninitializeApiImpl() {
-    if let Some(f) = pc().and_then(|p| p.uninit) {
-        f();
-    }
+    // The host runtime stays initialized until process exit. The title may still hold
+    // its interfaces or queues across pairs of GDK thunk initialization calls.
 }
 
 static ERROR_CB: Mutex<Option<(usize, usize)>> = Mutex::new(None);
@@ -330,27 +397,30 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
         *out = target as *const Obj as *mut c_void;
         return S_OK;
     }
-    match pc_object(&c, &i) {
+    let native_object = if c == XASYNC {
+        match async_runtime() {
+            RuntimeChoice::Xcl(reason) => {
+                note(c, i, format!("XAsync: XCL (fallback – {reason})"));
+                *out = xcl_xasync_object() as *const Obj as *mut c_void;
+                return S_OK;
+            }
+            RuntimeChoice::Pc { async_object, .. } if i == XASYNC => Some(async_object.get()),
+            _ => pc_object(&c, &i),
+        }
+    } else {
+        pc_object(&c, &i)
+    };
+    match native_object {
         Some(p) => {
             note(c, i, format!("{}: PC", family(&c)));
             *out = p as *mut c_void;
             S_OK
         }
-        None if c == XASYNC => {
-            let reason = if RUNTIME_CHOICE.load(Ordering::Acquire) == RuntimeChoice::Xcl as u8 {
-                "PC initialization failed"
-            } else {
-                "no system xgameruntime.dll"
-            };
-            note(c, i, format!("XAsync: XCL (fallback – {reason})"));
-            *out = xcl_xasync_object() as *const Obj as *mut c_void;
-            S_OK
-        }
         None if c == XACCESSIBILITY => {
-            let reason = if RUNTIME_CHOICE.load(Ordering::Acquire) == RuntimeChoice::Xcl as u8 {
-                "PC initialization failed"
-            } else {
-                "no system xgameruntime.dll"
+            let reason = match with_runtime_choice(|choice| *choice) {
+                RuntimeChoice::Xcl(reason) => reason,
+                RuntimeChoice::Pc { .. } => "PC interface unavailable",
+                _ => "PC initialization incomplete",
             };
             note(c, i, format!("XAccessibility: XCL (fallback – {reason})"));
             *out = xcl_xaccessibility_object() as *const Obj as *mut c_void;
@@ -683,8 +753,7 @@ fn legacy_ifaces() -> Vec<Iface> {
     ]
 }
 
-/// Built-in XAsync / XTaskQueue / XThread COM object used as a fallback when Gaming Services
-/// (`System32\xgameruntime.dll`) is not installed on the host.
+/// Built-in XAsync / XTaskQueue / XThread COM object when the host runtime is unavailable.
 fn xcl_xasync_object() -> &'static Obj {
     static O: OnceLock<&'static Obj> = OnceLock::new();
     O.get_or_init(|| {
@@ -693,8 +762,7 @@ fn xcl_xasync_object() -> &'static Obj {
     })
 }
 
-/// Built-in XAccessibility COM object used as a fallback when Gaming Services
-/// (`System32\xgameruntime.dll`) is not installed on the host.
+/// Built-in XAccessibility COM object when the host interface is unavailable.
 fn xcl_xaccessibility_object() -> &'static Obj {
     static O: OnceLock<&'static Obj> = OnceLock::new();
     O.get_or_init(|| {
@@ -1585,17 +1653,32 @@ mod tests {
     #[test]
     fn thunk_protocol_with_xcl_objects_on_pc_queues() {
         let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        RUNTIME_CHOICE.store(RuntimeChoice::Undecided as u8, Ordering::Release);
-        super::TOKENS_HERE.with(|t| t.set(Some(true)));
-        if pc().is_none() {
+        if load_pc().is_none() {
             println!("no system xgameruntime.dll – skipping");
             return;
         }
+
+        struct RestoreRuntime(RuntimeChoice);
+        impl Drop for RestoreRuntime {
+            fn drop(&mut self) {
+                let choice = with_runtime_choice(|choice| std::mem::replace(choice, self.0));
+                if let RuntimeChoice::Pc { runtime, .. } = choice {
+                    unsafe { runtime.uninitialize() };
+                }
+            }
+        }
+        let _runtime = RestoreRuntime(with_runtime_choice(|choice| std::mem::replace(choice, RuntimeChoice::Undecided)));
+        super::TOKENS_HERE.with(|t| t.set(Some(true)));
         unsafe {
             assert_eq!(InitializeApiImplEx2(0x6336_0000_2712, 0x65f4_0000_1edd, 2, std::ptr::null_mut()), S_OK);
+            let RuntimeChoice::Pc { async_object, .. } = with_runtime_choice(|choice| *choice) else {
+                println!("system xgameruntime.dll did not provide XAsync – skipping");
+                return;
+            };
             assert_eq!(query(XSTORE, XSTORE).0, REGDB_E_CLASSNOTREG);
             let (hr, xa) = query(XASYNC, XASYNC);
-            assert!(hr >= 0 && !xa.is_null(), "XAsync from PC: {hr:#x}");
+            assert_eq!(hr, S_OK);
+            assert_eq!(xa as usize, async_object.get());
             let get_status: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, bool) -> HRESULT = slot(xa, 3);
 
             // XUserAddAsync / Result through the vtable, completed on the PC process queue
@@ -1723,8 +1806,6 @@ mod tests {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            super::super::xasync::use_pc(0);
-            RUNTIME_CHOICE.store(RuntimeChoice::Undecided as u8, Ordering::Release);
             assert!(DONE.load(Ordering::SeqCst) >= 1, "XAsync completion callback");
         }
     }
@@ -2128,149 +2209,170 @@ mod tests {
         }
     }
 
+    struct MockPc;
+
+    impl MockPc {
+        fn install(runtime: &'static Pc) -> Self {
+            TEST_RUNTIME_CHOICE.with(|choice| *choice.lock().unwrap() = RuntimeChoice::Undecided);
+            PC_TEST_OVERRIDE.set(Some(runtime));
+            Self
+        }
+    }
+
+    impl Drop for MockPc {
+        fn drop(&mut self) {
+            PC_TEST_OVERRIDE.set(None);
+        }
+    }
+
+    unsafe extern "system" fn fail_init_ex2(_gdk: u64, _os: u64, _flags: u64, _opt: *mut c_void) -> HRESULT {
+        REGDB_E_CLASSNOTREG
+    }
+
+    unsafe extern "system" fn no_object(_c: *const Guid, _i: *const Guid, _out: *mut *mut c_void) -> HRESULT {
+        E_NOTIMPL
+    }
+
     #[test]
     fn xasync_fallback_when_pc_initialization_fails() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
         static QUERY_CALLS: AtomicUsize = AtomicUsize::new(0);
-        unsafe extern "system" fn spy_query(_c: *const Guid, _i: *const Guid, _out: *mut *mut c_void) -> HRESULT {
-            QUERY_CALLS.fetch_add(1, Ordering::SeqCst);
-            S_OK
-        }
-        unsafe extern "system" fn fail_init_ex2(_gdk: u64, _os: u64, _flags: u64, _opt: *mut c_void) -> HRESULT {
-            REGDB_E_CLASSNOTREG
-        }
-        unsafe extern "system" fn ok_init_ex2(_gdk: u64, _os: u64, _flags: u64, _opt: *mut c_void) -> HRESULT {
-            S_OK
-        }
+        static UNINIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-        static FAILING_PC: Pc = Pc {
-            query: spy_query,
-            init_ex2: Some(fail_init_ex2),
-            init_ex: None,
-            init: None,
-            uninit: None,
-        };
-        static RETRY_PC: Pc = Pc {
-            query: spy_query,
-            init_ex2: Some(ok_init_ex2),
-            init_ex: None,
-            init: None,
-            uninit: None,
-        };
+        unsafe extern "system" fn init(_gdk: u64, _os: u64, _flags: u64, _opt: *mut c_void) -> HRESULT {
+            if INIT_CALLS.fetch_add(1, Ordering::Relaxed) == 0 { REGDB_E_CLASSNOTREG } else { S_OK }
+        }
+        unsafe extern "system" fn query_pc(_c: *const Guid, _i: *const Guid, _out: *mut *mut c_void) -> HRESULT {
+            QUERY_CALLS.fetch_add(1, Ordering::Relaxed);
+            E_NOTIMPL
+        }
+        unsafe extern "system" fn uninit_pc() {
+            UNINIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        static FAILING_PC: Pc = Pc { query: query_pc, init_ex2: Some(init), init_ex: None, init: None, uninit: Some(uninit_pc) };
 
-        // Reset state for this test
-        QUERY_CALLS.store(0, Ordering::SeqCst);
-        RUNTIME_CHOICE.store(RuntimeChoice::Undecided as u8, Ordering::Release);
-        super::super::xasync::use_pc(0);
-        unsafe { set_pc_for_test(Some(&FAILING_PC)) };
-
+        let _pc = MockPc::install(&FAILING_PC);
         unsafe {
-            // 1. Title calls InitializeApiImplEx2. Host runtime fails with 0x80040154.
-            assert_eq!(InitializeApiImplEx2(0x6336_0000_2712, 0x65f4_0000_1edd, 2, std::ptr::null_mut()), S_OK);
-            assert_eq!(RUNTIME_CHOICE.load(Ordering::Acquire), RuntimeChoice::Xcl as u8);
-
-            // 2. Title calls QueryApiImpl(XASYNC). Must return XCL object with zero Windows DLL query calls.
+            assert_eq!(InitializeApiImplEx2(1, 2, 3, std::ptr::null_mut()), S_OK);
             let (hr, xa) = query(XASYNC, XASYNC);
             assert_eq!(hr, S_OK);
             assert_eq!(xa, xcl_xasync_object() as *const Obj as *mut c_void);
-            assert_eq!(QUERY_CALLS.load(Ordering::SeqCst), 0, "Windows DLL query must not be called");
 
-            // 3. Create and use a queue through that returned object.
-            let q_create: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT = slot(xa, 12);
-            let q_close: unsafe extern "system" fn(*mut c_void, *mut c_void) = slot(xa, 17);
-            let q_submit: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, usize) -> HRESULT = slot(xa, 18);
-            let q_dispatch: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) -> bool = slot(xa, 21);
-
-            static WORK_RAN: AtomicU32 = AtomicU32::new(0);
-            unsafe extern "system" fn test_work(_ctx: *mut c_void, _canceled: bool) {
-                WORK_RAN.fetch_add(1, Ordering::SeqCst);
+            let q_create: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT = slot(xa, slot_in_table("XTaskQueueCreate").2);
+            let q_dispatch: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) -> bool = slot(xa, slot_in_table("XTaskQueueDispatch").2);
+            let q_close: unsafe extern "system" fn(*mut c_void, *mut c_void) = slot(xa, slot_in_table("XTaskQueueCloseHandle").2);
+            unsafe extern "system" fn test_work(ctx: *mut c_void, canceled: bool) {
+                *ctx.cast::<bool>() = !canceled;
             }
 
             let mut q = std::ptr::null_mut();
-            assert_eq!(q_create(xa, 0, 0, &mut q), S_OK);
-            assert!(!q.is_null());
-            assert_eq!(q_submit(xa, q, 0, std::ptr::null_mut(), test_work as usize), S_OK);
-            assert!(q_dispatch(xa, q, 0, 0));
-            assert_eq!(WORK_RAN.load(Ordering::SeqCst), 1);
-
-            // 4. Close the test's own queue handle cleanly.
+            let mut ran = false;
+            assert_eq!(q_create(xa, MODE_MANUAL, MODE_MANUAL, &mut q), S_OK);
+            let submitted = super::super::xasync::submit_callback(q, PORT_WORK, (&mut ran as *mut bool).cast(), test_work as usize);
+            let dispatched = q_dispatch(xa, q, PORT_WORK, 0);
             q_close(xa, q);
+            assert_eq!(submitted, S_OK);
+            assert!(dispatched && ran);
 
-            // 5. Test a later initialization attempt: a subsequent retry cannot override XCL fallback.
-            set_pc_for_test(Some(&RETRY_PC));
-            assert_eq!(InitializeApiImplEx2(0x6336_0000_2712, 0x65f4_0000_1edd, 2, std::ptr::null_mut()), S_OK);
-            assert_eq!(RUNTIME_CHOICE.load(Ordering::Acquire), RuntimeChoice::Xcl as u8, "Retry must not override Xcl fallback");
+            let (hr, accessibility) = query(XACCESSIBILITY, g(0xd722b373_8c4d_4692_9e51_d6ad9b37aa7d));
+            assert_eq!(hr, S_OK);
+            assert_eq!(accessibility, xcl_xaccessibility_object() as *const Obj as *mut c_void);
+            assert_eq!(query(XGAMEUI, XGAMEUI).0, S_OK);
+            assert_eq!(query(g(1), g(1)).0, REGDB_E_CLASSNOTREG);
 
-            let (hr2, xa2) = query(XASYNC, XASYNC);
-            assert_eq!(hr2, S_OK);
-            assert_eq!(xa2, xcl_xasync_object() as *const Obj as *mut c_void);
-            assert_eq!(QUERY_CALLS.load(Ordering::SeqCst), 0, "Windows DLL query must still not be called after retry");
-
-            // Cleanup test state
-            set_pc_for_test(None);
-            RUNTIME_CHOICE.store(RuntimeChoice::Undecided as u8, Ordering::Release);
+            UninitializeApiImpl();
+            assert_eq!(InitializeApiImplEx2(1, 2, 3, std::ptr::null_mut()), S_OK);
+            assert_eq!(query(XASYNC, XASYNC), (S_OK, xa));
+            assert_eq!(INIT_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(QUERY_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(UNINIT_CALLS.load(Ordering::Relaxed), 0);
         }
     }
 
     #[test]
     fn pc_init_preserves_real_hresult_when_older_entry_points_are_absent() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pc = Pc { query: no_object, init_ex2: Some(fail_init_ex2), init_ex: None, init: None, uninit: None };
+        assert_eq!(unsafe { pc.initialize(1, 2, 3, std::ptr::null_mut()) }, REGDB_E_CLASSNOTREG);
+    }
 
-        unsafe extern "system" fn fail_ex2(_gdk: u64, _os: u64, _flags: u64, _opt: *mut c_void) -> HRESULT {
-            REGDB_E_CLASSNOTREG
+    unsafe extern "system" fn mock_async(c: *const Guid, i: *const Guid, out: *mut *mut c_void) -> HRESULT {
+        if *c != XASYNC || *i != XASYNC {
+            return REGDB_E_CLASSNOTREG;
         }
-        unsafe extern "system" fn dummy_query(_c: *const Guid, _i: *const Guid, _out: *mut *mut c_void) -> HRESULT {
+        unsafe extern "system" fn status(_this: usize, _block: *mut XAsyncBlock, _wait: bool) -> HRESULT {
             E_NOTIMPL
         }
-
-        static PC_NO_OLDER: Pc = Pc {
-            query: dummy_query,
-            init_ex2: Some(fail_ex2),
-            init_ex: None,
-            init: None,
-            uninit: None,
-        };
-
-        RUNTIME_CHOICE.store(RuntimeChoice::Undecided as u8, Ordering::Release);
-        unsafe {
-            set_pc_for_test(Some(&PC_NO_OLDER));
-            pc_init(1, 2, 3, std::ptr::null_mut());
-            assert_eq!(RUNTIME_CHOICE.load(Ordering::Acquire), RuntimeChoice::Xcl as u8);
-            set_pc_for_test(None);
-            RUNTIME_CHOICE.store(RuntimeChoice::Undecided as u8, Ordering::Release);
-        }
+        static VTABLE: OnceLock<[usize; 4]> = OnceLock::new();
+        static OBJECT: OnceLock<usize> = OnceLock::new();
+        let vtable = VTABLE.get_or_init(|| [0, 0, 0, status as usize]);
+        *out = std::ptr::from_ref(OBJECT.get_or_init(|| vtable.as_ptr() as usize)).cast_mut().cast();
+        S_OK
     }
 
     #[test]
     fn pc_init_falls_back_to_older_entry_points_if_present() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        unsafe extern "system" fn fail_ex2(_gdk: u64, _os: u64, _flags: u64, _opt: *mut c_void) -> HRESULT {
-            REGDB_E_CLASSNOTREG
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn ok_ex(_gdk: u64, _os: u64, _flags: u64) -> HRESULT {
+            if INIT_CALLS.fetch_add(1, Ordering::Relaxed) == 0 { S_OK } else { REGDB_E_CLASSNOTREG }
         }
+        static PC_CASCADE: Pc = Pc {
+            query: mock_async, init_ex2: Some(fail_init_ex2), init_ex: Some(ok_ex), init: None, uninit: None,
+        };
+        let _pc = MockPc::install(&PC_CASCADE);
+        unsafe {
+            assert_eq!(InitializeApiImplEx2(1, 2, 3, std::ptr::null_mut()), S_OK);
+            let (hr, xa) = query(XASYNC, XASYNC);
+            assert_eq!(hr, S_OK);
+            assert_eq!(pc_async_object().unwrap().get(), xa as usize);
+            assert_eq!(XAsyncGetStatus(std::ptr::null_mut(), false), E_NOTIMPL);
+            assert_eq!(query(XASYNC, g(1)).0, REGDB_E_CLASSNOTREG);
+            UninitializeApiImpl();
+            assert_eq!(InitializeApiImplEx2(1, 2, 3, std::ptr::null_mut()), S_OK);
+            assert_eq!(query(XASYNC, XASYNC), (S_OK, xa));
+            assert_eq!(INIT_CALLS.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn pc_init_keeps_xcl_if_async_is_requested_during_native_init() {
+        static REENTRANT_XASYNC: AtomicUsize = AtomicUsize::new(0);
+        static UNINIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn reenter(_gdk: u64, _os: u64, _flags: u64, _opt: *mut c_void) -> HRESULT {
+            REENTRANT_XASYNC.store(query(XASYNC, XASYNC).1 as usize, Ordering::Relaxed);
+            S_OK
+        }
+        unsafe extern "system" fn uninit_pc() {
+            UNINIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        static PC_REENTRANT: Pc = Pc {
+            query: mock_async, init_ex2: Some(reenter), init_ex: None, init: None, uninit: Some(uninit_pc),
+        };
+        let _pc = MockPc::install(&PC_REENTRANT);
+        unsafe {
+            assert_eq!(InitializeApiImplEx2(1, 2, 3, std::ptr::null_mut()), S_OK);
+            let (hr, xa) = query(XASYNC, XASYNC);
+            assert_eq!(hr, S_OK);
+            assert_eq!(xa, xcl_xasync_object() as *const Obj as *mut c_void);
+            assert_eq!(REENTRANT_XASYNC.load(Ordering::Relaxed), xa as usize);
+            assert!(pc_async_object().is_none());
+            assert_eq!(UNINIT_CALLS.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn pc_init_requires_a_nonnull_native_async_object() {
         unsafe extern "system" fn ok_ex(_gdk: u64, _os: u64, _flags: u64) -> HRESULT {
             S_OK
         }
-        unsafe extern "system" fn dummy_query(_c: *const Guid, _i: *const Guid, _out: *mut *mut c_void) -> HRESULT {
-            E_NOTIMPL
+        unsafe extern "system" fn null_object(_c: *const Guid, _i: *const Guid, _out: *mut *mut c_void) -> HRESULT {
+            S_OK
         }
-
-        static PC_CASCADE: Pc = Pc {
-            query: dummy_query,
-            init_ex2: Some(fail_ex2),
-            init_ex: Some(ok_ex),
-            init: None,
-            uninit: None,
-        };
-
-        RUNTIME_CHOICE.store(RuntimeChoice::Undecided as u8, Ordering::Release);
+        static PC_WITHOUT_ASYNC: Pc = Pc { query: null_object, init_ex2: None, init_ex: Some(ok_ex), init: None, uninit: None };
+        let _pc = MockPc::install(&PC_WITHOUT_ASYNC);
         unsafe {
-            set_pc_for_test(Some(&PC_CASCADE));
-            pc_init(1, 2, 3, std::ptr::null_mut());
-            assert_eq!(RUNTIME_CHOICE.load(Ordering::Acquire), RuntimeChoice::Pc as u8);
-            set_pc_for_test(None);
-            RUNTIME_CHOICE.store(RuntimeChoice::Undecided as u8, Ordering::Release);
+            assert_eq!(InitializeApiImplEx2(1, 2, 3, std::ptr::null_mut()), S_OK);
+            assert!(pc_async_object().is_none());
+            assert_eq!(query(XASYNC, XASYNC), (S_OK, xcl_xasync_object() as *const Obj as *mut c_void));
         }
     }
 }
