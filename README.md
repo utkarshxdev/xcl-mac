@@ -69,7 +69,7 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 ### 4. Wine & CrossOver Stability
 - **XGameRuntime fallback** uses XCL's built-in async and accessibility APIs if the host runtime cannot initialize or provide its XAsync interface. That backend choice stays in place for the lifetime of the process.
 - **Isolated DXC Thread Heaps (`own_heaps`):** Allocates private heap spaces for parallel DXC shader compilation threads, eliminating concurrency crashes in Wine's memory manager.
-- **DirectStorage:** Decodes BC1, BC3, BC4, BC5, BC6H, and BC7 requests using the upstream XCL decoder. Queues created with `AutoSubmitDisabled` wait for the title to submit their requests.
+- **DirectStorage:** Decodes BC1, BC3, BC4, BC5, BC6H, and BC7 requests using the upstream XCL decoder. Queues created with `AutoSubmitDisabled` wait for the title to submit their requests and block producers when the queue is full.
 - **Default Network Isolation (`netoff.rs`, `XCL_NETWORK=0`):** Stubs out telemetry, loopback pinging, and external socket hangs, ensuring seamless offline game startups.
 
 ---

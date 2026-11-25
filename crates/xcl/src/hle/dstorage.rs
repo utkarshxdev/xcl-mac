@@ -1198,6 +1198,7 @@ struct QueueInner {
     capacity: usize,
     auto_submit_disabled: bool,
     pending: Mutex<Pending>,
+    room: Condvar,
     cancels: Mutex<Vec<CancelRule>>,
     worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
     worker_active: (Mutex<bool>, Condvar),
@@ -1268,6 +1269,9 @@ impl QueueInner {
         let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
         if batch.is_empty() {
             return;
+        }
+        if self.auto_submit_disabled {
+            self.room.notify_all();
         }
         if w.is_none() {
             let (tx, rx) = mpsc::channel::<Vec<Entry>>();
@@ -1367,9 +1371,17 @@ impl QueueInner {
         }
     }
 
+    /// A manual queue holds a producer at capacity until entries leave or the queue closes.
+    fn pending_for_enqueue(&self) -> std::sync::MutexGuard<'_, Pending> {
+        let pending = self.pending.lock().unwrap();
+        self.room.wait_while(pending, |p| {
+            self.auto_submit_disabled && p.entries.len() >= self.capacity && !self.closed.load(Ordering::Acquire)
+        }).unwrap()
+    }
+
     fn enqueue(self: &Arc<Self>, e: Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.pending_for_enqueue();
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1389,7 +1401,7 @@ impl QueueInner {
 
     fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.pending_for_enqueue();
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1476,6 +1488,7 @@ unsafe fn factory_create_queue_with_options(_p: *mut c_void, desc: *const u8, op
         capacity,
         auto_submit_disabled: options & QUEUE_OPT_AUTO_SUBMIT_DISABLED != 0,
         pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1 }),
+        room: Condvar::new(),
         cancels: Mutex::new(Vec::new()),
         worker: Mutex::new(None),
         worker_active: (Mutex::new(false), Condvar::new()),
@@ -1617,6 +1630,9 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
         pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } if req.tag & mask == value));
+        if q.auto_submit_disabled && pend.entries.len() < q.capacity {
+            q.room.notify_all();
+        }
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1644,6 +1660,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
             std::mem::take(&mut pend.entries)
         }
     };
+    q.room.notify_all();
     for e in drained {
         if let Entry::Status(s, i) = e {
             if let Some(slot) = s.slots.get(i as usize) {
@@ -2755,6 +2772,58 @@ mod tests {
             queue_close(q);
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    #[test]
+    fn full_manual_queue_waits_for_submit_cancel_or_close() {
+        use std::time::Duration;
+
+        enum Wake { Submit, Cancel, Close }
+        for wake in [Wake::Submit, Wake::Cancel, Wake::Close] {
+            unsafe {
+                let mut desc = [0u8; 0x20];
+                desc[0] = 1; // memory source
+                desc[8] = 2; // capacity
+                desc[10] = 2; // priority
+                desc[0x18] = QUEUE_OPT_AUTO_SUBMIT_DISABLED as u8;
+                let mut q = std::ptr::null_mut();
+                let mut s = std::ptr::null_mut();
+                assert_eq!(factory_create_queue1(std::ptr::null_mut(), desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+                assert_eq!(factory_create_status_array(std::ptr::null_mut(), 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+                let mut destination = [0u8; 1];
+                let req = request(SOURCE_MEMORY_BIT, destination.as_mut_ptr() as u64, 1, b"x".as_ptr() as u64, 0, 1);
+                queue_enqueue_request(q, req.as_ptr());
+                queue_enqueue_status(q, s, 0);
+
+                let (ready, started) = mpsc::channel();
+                let (done, finished) = mpsc::channel();
+                let (qp, sp) = (q as usize, s as usize);
+                let enqueue_status = matches!(wake, Wake::Cancel);
+                let producer = std::thread::spawn(move || {
+                    ready.send(()).unwrap();
+                    if enqueue_status {
+                        queue_enqueue_status(qp as *mut c_void, sp as *mut c_void, 1);
+                    } else {
+                        queue_enqueue_request(qp as *mut c_void, req.as_ptr());
+                    }
+                    done.send(()).unwrap();
+                });
+                started.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(finished.recv_timeout(Duration::from_millis(150)), Err(mpsc::RecvTimeoutError::Timeout), "an enqueue into a full manual queue must wait");
+                match wake {
+                    Wake::Submit => queue_submit(q),
+                    Wake::Cancel => queue_cancel(q, 0, 0),
+                    Wake::Close => queue_close(q),
+                }
+                finished.recv_timeout(Duration::from_secs(5)).expect("the waiting producer must wake");
+                producer.join().unwrap();
+                let pending = queue(q).pending.lock().unwrap().entries.len();
+                assert_eq!(pending, match wake { Wake::Submit => 1, Wake::Cancel => 2, Wake::Close => 0 });
+                queue_close(q);
+                queue_release(q);
+                status_release(s);
+            }
         }
     }
 
