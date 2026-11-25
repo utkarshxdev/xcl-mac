@@ -111,6 +111,8 @@ struct Table {
     shadowed_by_va: BTreeMap<(usize, usize), usize>,
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
+    /// Reactivated placements whose COM reference was unavailable during Release.
+    deferred_remaps: BTreeMap<usize, u64>,
     next_seq: u64,
 }
 
@@ -122,6 +124,7 @@ impl Table {
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
+            deferred_remaps: BTreeMap::new(),
             next_seq: 0,
         }
     }
@@ -369,17 +372,13 @@ unsafe fn clone_resource(res: usize, mac: bool) -> Option<ID3D12Resource> {
     }
 }
 
-unsafe fn clone_resources(ptrs: &[usize]) -> Vec<ID3D12Resource> {
-    ptrs.iter()
-        .filter_map(|&raw| {
-            let p = raw as *mut c_void;
-            ID3D12Resource::from_raw_borrowed(&p).map(|r| r.clone())
-        })
-        .collect()
+unsafe fn clone_resources(ptrs: &[usize], mac: bool) -> Vec<ID3D12Resource> {
+    ptrs.iter().filter_map(|&res| clone_resource(res, mac)).collect()
 }
 
 /// PC texture → its place in the title's memory
 static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
+static REMAPS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // The dirty-page scan consumes write-watch state for every submission thread.
 // Keep the scan, pending-list update and GPU uploads together.
 static REFRESH: Mutex<()> = Mutex::new(());
@@ -478,7 +477,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
-        clone_resources(&unmap_ptrs)
+        clone_resources(&unmap_ptrs, crate::util::mac_host())
     };
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
@@ -592,7 +591,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         let (delta, retired, unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
-        (retired, clone_resources(&unmap_ptrs))
+        (retired, clone_resources(&unmap_ptrs, crate::util::mac_host()))
     };
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
@@ -607,10 +606,25 @@ pub fn forget(res: usize) {
     LAST_CONTENT.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
+        t.deferred_remaps.remove(&res);
         let (removed, delta, remap_ptrs) = t.remove(res);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
-        (removed, unsafe { clone_resources(&remap_ptrs) })
+        let mac = crate::util::mac_host();
+        let mut to_remap = Vec::new();
+        for res in remap_ptrs {
+            if let Some(r) = unsafe { clone_resource(res, mac) } {
+                t.deferred_remaps.remove(&res);
+                to_remap.push(r);
+            } else if mac {
+                // A non-final Release can overlap the remap too. Retry before the next
+                // submit if the placement is still active and has the same identity.
+                let seq = t.by_res[&res].seq;
+                t.deferred_remaps.insert(res, seq);
+            }
+        }
+        REMAPS_PENDING.store(!t.deferred_remaps.is_empty(), Ordering::Release);
+        (removed, to_remap)
     };
     for r in &to_remap {
         unsafe {
@@ -619,6 +633,30 @@ pub fn forget(res: usize) {
     }
     if removed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
+unsafe fn retry_deferred_remaps() {
+    if !REMAPS_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    let to_remap = {
+        let mut t = TEXTURES.lock().unwrap();
+        let Table { by_res, deferred_remaps, .. } = &mut *t;
+        let mut to_remap = Vec::new();
+        deferred_remaps.retain(|&res, &mut seq| {
+            if !by_res.get(&res).is_some_and(|entry| entry.seq == seq) {
+                return false;
+            }
+            let Some(r) = clone_resource(res, true) else { return true };
+            to_remap.push(r);
+            false
+        });
+        REMAPS_PENDING.store(!deferred_remaps.is_empty(), Ordering::Release);
+        to_remap
+    };
+    for r in &to_remap {
+        super::vram::remap_if_unmapped(r);
     }
 }
 
@@ -796,6 +834,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
+    retry_deferred_remaps();
     recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
@@ -2474,6 +2513,35 @@ mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+
+        // A superseded placement can still be in the table while Release is in flight.
+        // Use a synthetic COM object so an unguarded AddRef fails an assertion safely.
+        #[repr(C)]
+        struct FakeResource {
+            vtable: *const usize,
+            refs: AtomicU64,
+        }
+        unsafe extern "system" fn add_ref(this: *mut FakeResource) -> u32 {
+            ((*this).refs.fetch_add(1, Ordering::Relaxed) + 1) as u32
+        }
+        unsafe extern "system" fn release(this: *mut FakeResource) -> u32 {
+            ((*this).refs.fetch_sub(1, Ordering::Relaxed) - 1) as u32
+        }
+        let vtable = [0, add_ref as usize, release as usize];
+        let mut older = FakeResource { vtable: vtable.as_ptr(), refs: AtomicU64::new(1) };
+        let older_address = std::ptr::from_mut(&mut older) as usize;
+        let mut overlap = Table::new();
+        overlap.insert(older_address, entry(0x30_0000, &tex_16k, true, true));
+        let in_flight = ResourceRelease::begin(older_address);
+        let (_, unmap) = overlap.insert(13, entry(0x30_0000, &tex_64k, true, true));
+        assert_eq!(unmap, vec![older_address]);
+        assert!(unsafe { clone_resources(&unmap, true) }.is_empty());
+        drop(in_flight);
+        assert_eq!(older.refs.load(Ordering::Relaxed), 1);
+        let refs = unsafe { clone_resources(&unmap, false) };
+        assert_eq!(older.refs.load(Ordering::Relaxed), 2);
+        drop(refs);
+        assert_eq!(older.refs.load(Ordering::Relaxed), 1);
     }
 
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased

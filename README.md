@@ -62,7 +62,7 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 ### 3. Unified Memory Architecture (UMA) Fast Paths
 - **UMA Video Memory Shadowing (`Uma::shadowed`):** Emulates console shared memory without requiring `OpenExistingHeapFromAddress` (unsupported by Wine), enabling high-speed zero-copy CPU-to-GPU data flow.
 - **Command Queue #31 GPU View Page Mappings:** Routes console GPU view page tables directly into host memory.
-- **Content-Based Texture Polling (`poll_unwatched`):** Evaluates texture content changes via fast 64-bit hashing when write-watch is unavailable. Uploads skip textures while their host resources are being released.
+- **Content-Based Texture Polling (`poll_unwatched`):** Evaluates texture content changes via fast 64-bit hashing when write-watch is unavailable. Polling and overlap handling guard texture references against concurrent release.
 - **Unchanged Texture Upload Skip (`XCL_TEXTURE_SKIP_UNCHANGED=1`):** Skips redundant GPU buffer re-uploads, saving precious PCIe/UMA bandwidth.
 
 ### 4. Wine & CrossOver Stability
