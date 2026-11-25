@@ -63,11 +63,12 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 - **UMA Video Memory Shadowing (`Uma::shadowed`):** Emulates console shared memory without requiring `OpenExistingHeapFromAddress` (unsupported by Wine), enabling high-speed zero-copy CPU-to-GPU data flow.
 - **Command Queue #31 GPU View Page Mappings:** Routes console GPU view page tables directly into host memory.
 - **Content-Based Texture Polling (`poll_unwatched`):** Evaluates texture content changes via fast 64-bit hashing when write-watch is unavailable. Polling and overlap handling guard texture references against concurrent release.
-- **Unchanged Texture Upload Skip (`XCL_TEXTURE_SKIP_UNCHANGED=1`):** Skips redundant GPU buffer re-uploads, saving precious PCIe/UMA bandwidth.
+- **Texture Uploads on Mac:** Keep `XCL_TEXTURE_SKIP_UNCHANGED=0` or leave it unset. Enabling the shortcut has produced blank frames on D3DMetal.
 
 ### 4. Wine & CrossOver Stability
 - **XGameRuntime fallback** uses XCL's built-in async and accessibility APIs if the host runtime cannot initialize or provide its XAsync interface. That backend choice stays in place for the lifetime of the process.
 - **Isolated DXC Thread Heaps (`own_heaps`):** Allocates private heap spaces for parallel DXC shader compilation threads, eliminating concurrency crashes in Wine's memory manager.
+- **DirectStorage BCPack:** Decodes BC1, BC3, BC4, BC5, BC6H, and BC7 requests using the upstream XCL decoder.
 - **Default Network Isolation (`netoff.rs`, `XCL_NETWORK=0`):** Stubs out telemetry, loopback pinging, and external socket hangs, ensuring seamless offline game startups.
 
 ---
@@ -101,14 +102,14 @@ Launch your title through your Wine environment with the recommended Mac environ
 
 ```bash
 # Recommended launch command inside your bottle:
-env XCL_TEXTURE_SKIP_UNCHANGED=1 XCL_NETWORK=0 wine64 xcl.exe run "C:\Games\YourTitle"
+env XCL_TEXTURE_SKIP_UNCHANGED=0 XCL_NETWORK=0 wine64 xcl.exe run "C:\Games\YourTitle"
 ```
 
 ### Environment Variable Reference
 
 | Variable | Default (Mac) | Default (Win) | Purpose |
 | :--- | :---: | :---: | :--- |
-| `XCL_TEXTURE_SKIP_UNCHANGED` | `1` | `0` | Re-presents textures without re-uploading unchanged memory |
+| `XCL_TEXTURE_SKIP_UNCHANGED` | `0` | `1` | Skips repeat uploads when a texture's memory matches its last upload |
 | `XCL_NETWORK` | `0` (Off) | `1` (On) | Isolates GDK telemetry to offline stubs (prevents hangs) |
 | `XCL_DXC_HEAP` | `1` (On) | `0` (Off) | Gives each DXC compilation worker an isolated thread heap |
 | `XCL_MASKED_STORES` | `1` (On) | `0` (Off) | Rewrites AVX masked stores to safe Rosetta 2 helper calls |

@@ -894,6 +894,12 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures in memory that is not write-watched: by content
     let on_mac = crate::util::mac_host();
+    if trace_unwatched() {
+        static LOGGED_REFRESH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        LOGGED_REFRESH.get_or_init(|| {
+            crate::xlog_info!("title texture trace: Mac content polling {on_mac}, skip unchanged uploads {}", unchanged_skip());
+        });
+    }
     let mut todo = if on_mac { poll_unwatched() } else { Vec::new() };
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         upload_all(todo);
@@ -1201,6 +1207,19 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
             places.push((e.seq, e.va, e.sent));
         }
         let picked = pick(&all, frame, new_frame, &mut CURSORS.lock().unwrap());
+        if picked.is_empty() && trace_unwatched() {
+            static EMPTY_LOOKS: AtomicU64 = AtomicU64::new(0);
+            let n = EMPTY_LOOKS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n.is_power_of_two() {
+                let pending = t.by_res.values().filter(|e| e.pending).count();
+                let gpu_written = t.by_res.values().filter(|e| e.gpu_written).count();
+                let unwatched = t.by_res.values().filter(|e| e.unwatched).count();
+                crate::xlog_info!(
+                    "title texture trace: empty content look #{n}, frame {frame}: {} active, {unwatched} unwatched, {pending} pending, {gpu_written} GPU-written, {} eligible",
+                    t.by_res.len(), all.len()
+                );
+            }
+        }
         let look: Vec<_> = picked.into_iter().map(|i| {
             let (seq, va, sent) = places[i];
             (all[i].key, seq, va, all[i].size, sent)
