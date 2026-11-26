@@ -58,6 +58,7 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 - **Command-List Creation:** Device slot 73 distinguishes shader-cache sessions by their explicit interface IDs. On Mac hosts, console-only command-list IDs are translated to the standard PC graphics command-list interface.
 - **Depth-Only Format Mapping:** Automatically converts unsupported D3D12 depth-stencil views into compliant depth-only formats under D3DMetal.
 - **Mesh Shader Pipelines:** XCL translates console mesh shaders supplied in the amplification slot and splits large mesh outputs to fit D3D12 limits.
+- **Ray Traversal:** Rays miss when the acceleration-structure descriptor is empty.
 - **Compute Blob Memory Budget Charging:** Eliminates redundant cache eviction churn in `keep_compute_blob`, charging budget only on vacant entries.
 
 ### 3. Unified Memory Architecture (UMA) Fast Paths

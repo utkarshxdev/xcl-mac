@@ -2105,6 +2105,7 @@ impl Em {
                 )
             };
             let (d0, d1) = (self.sreg(srsrc), self.sreg(srsrc + 1));
+            let (d2, d3) = (self.sreg(srsrc + 2), self.sreg(srsrc + 3));
             let a = self.t();
             let t = self.t();
             let act = self.act();
@@ -2114,9 +2115,16 @@ impl Em {
                 Some(hi) => format!("((((uint64_t){hi} << 32) | (uint64_t)({node} & ~7u)) << 3)"),
                 None => format!("((uint64_t)({node} & ~7u) << 3)"),
             };
+            // The device writes an all-zero descriptor when a BVH cannot be mapped.
+            // A valid descriptor can have base 0 when the node carries the address.
+            self.line(&format!("uint4 {t};"));
+            self.line(&format!("[branch] if (({d0} | {d1} | {d2} | {d3}) != 0u) {{"));
             self.line(&format!("uint64_t {a} = ((((uint64_t)({d1} & 0xFFu) << 32) | (uint64_t){d0}) << 8) + {off};"));
             self.window_read(&format!("(uint)({a} >> 32)"));
-            self.line(&format!("uint4 {t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
+            self.line(&format!("{t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
+            self.line("} else {");
+            self.line(&format!("{t} = ({node} & 7u) <= 3u ? uint4(0x7F800000u, asuint(1.0f), 0u, 0u) : uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);"));
+            self.line("}");
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             return Ok(());

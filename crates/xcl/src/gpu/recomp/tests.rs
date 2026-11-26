@@ -4180,6 +4180,18 @@ fn gpu_bvh_intersect_ray() {
             assert_eq!(q(116), q(112), "lane {l}: 64-bit node pointer gives the same");
         }
     }
+
+    // XCL writes an all-zero descriptor for a missing acceleration structure. Put otherwise
+    // hittable nodes at its computed offsets to catch a traversal through that descriptor.
+    st.sgpr[8..16].fill(0);
+    mem.copy_within(base / 4.., 0);
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    for (lane, v) in res.vgpr.iter().enumerate() {
+        assert_eq!(&v[100..112], &[F; 12], "lane {lane}: empty descriptor has no box hits");
+        let miss = [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0];
+        assert_eq!(&v[112..116], &miss, "lane {lane}: empty descriptor has no triangle hit");
+        assert_eq!(&v[116..120], &miss, "lane {lane}: empty descriptor has no 64-bit triangle hit");
+    }
 }
 
 /// Checks the compute ABI read from the FSSM stage descriptor (+0x38 COMPUTE_PGM_RSRC2,
