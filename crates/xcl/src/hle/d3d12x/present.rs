@@ -91,15 +91,29 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
+    const RETAIL_PLANE_STRIDE: usize = 72;
+    let mut chosen_res = 0;
+    for i in 0..plane_count as usize {
+        let p = planes.add(i * RETAIL_PLANE_STRIDE);
+        if !crate::gpu::shader::readable(p as usize, 0x18) {
+            continue;
+        }
+        let count = (p.add(8) as *const u32).read_unaligned();
+        let list = (p.add(0x10) as *const usize).read_unaligned();
+        if count > 0 && crate::gpu::shader::readable(list, 8) {
+            let res = (list as *const usize).read_unaligned();
+            if res != 0 {
+                chosen_res = res;
+                if backbuffer_like(res).is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    if chosen_res == 0 || !enabled() {
         return;
     }
-    let res = (list as *const usize).read_unaligned();
-    if res == 0 {
-        return;
-    }
+    let res = chosen_res;
     {
         let mut p = PRESENTED.lock().unwrap();
         if !p.contains(&res) {

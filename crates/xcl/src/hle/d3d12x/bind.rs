@@ -760,7 +760,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     with(this, |s| s.arena.take(u, size, 16, &mut s.uma)).map(|p| p as usize)
                 })
             }).map(|packed| {
-                pc(this, packed.signature.as_raw() as usize, max, packed.arguments.as_raw() as usize, 0, count_buf, count_off);
+                fresh_indirect_arguments(this, || {
+                    pc(this, packed.signature.as_raw() as usize, max, packed.arguments.as_raw() as usize, 0, count_buf, count_off);
+                });
                 packed.finish_gpu(list);
                 with(this, |s| {
                     let shadow = if gfx { &mut s.args_gfx } else { &mut s.args };
@@ -769,7 +771,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             })
         }
         Some(None) => Err("unsupported root-changing command signature".into()),
-        None => bind_abi(this, list, pso, gfx).map(|()| pc(this, sig, max, args, args_pc_off, count_buf, count_off)),
+        None => bind_abi(this, list, pso, gfx).map(|()| {
+            fresh_indirect_arguments(this, || {
+                pc(this, sig, max, args, args_pc_off, count_buf, count_off);
+            });
+        }),
     };
     match result {
         Ok(()) => {

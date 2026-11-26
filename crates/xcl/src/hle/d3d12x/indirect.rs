@@ -268,11 +268,8 @@ impl Recorded {
         transition(list, &self.arguments, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
-    pub(super) fn retain_and_clear(self, allocator: usize, shadow: &mut [u8]) {
+    pub(super) fn retain_and_clear(self, allocator: usize, _shadow: &mut [u8]) {
         retain_resource(allocator, self.arguments);
-        for p in self.patches {
-            shadow[p.shadow..p.shadow + 4].fill(0);
-        }
     }
 }
 
