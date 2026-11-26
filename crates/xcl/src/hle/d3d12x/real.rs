@@ -3997,6 +3997,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    if super::list_x::trace_gpu_stall() {
+        crate::xlog_info!("D3D12.X: stall capture PSO {:p}: compute shader {:016x}", *ppv, crate::gpu::shader::fnv64(cs));
+    }
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -4828,6 +4831,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
+    if super::list_x::trace_gpu_stall() {
+        crate::xlog_info!("D3D12.X: stall capture PSO {:p}: {kind} shader DXIL {:016x}", *ppv, crate::gpu::shader::fnv64(&tp.cs));
+    }
     TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {

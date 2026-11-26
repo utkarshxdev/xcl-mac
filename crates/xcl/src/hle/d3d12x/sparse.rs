@@ -1371,8 +1371,8 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     s.rb_value += 1;
     let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
+    if queue.Signal(&s.rb_fence, v).is_ok() && s.queue.Wait(&s.rb_fence, v).is_ok() && super::list_x::trace_gpu_stall() {
+        super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback", &s.rb_fence, v);
     }
     s.readback_ranges(&merged);
 }
@@ -1691,7 +1691,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     s.scratch_runs = dirty_runs;
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
-        let _ = queue.Wait(&s.fence, s.value);
+        if queue.Wait(&s.fence, s.value).is_ok() && super::list_x::trace_gpu_stall() {
+            super::list_x::note_internal_wait(q, "sparse uploads", &s.fence, s.value);
+        }
         s.waited.insert(q, s.value);
     }
 }

@@ -9,10 +9,11 @@
 //! queue signals it, and a worker thread does the writes, in submission order, when the GPU is
 //! there – what bottom of pipe means.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HANDLE;
@@ -48,6 +49,9 @@ struct Job {
     fence: ID3D12Fence,
     value: u64,
     writes: Vec<Write>,
+    submitted: Instant,
+    warned: bool,
+    lists: Vec<String>,
 }
 
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
@@ -63,64 +67,82 @@ unsafe impl Send for QueueFence {}
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 
-/// how long the worker waits for one submission before writing anyway (a removed device, a
-/// queue that never gets there)
-const WAIT_MS: u32 = 4_000;
+const STALL_AFTER: Duration = Duration::from_secs(10);
+static INCOMING: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
-fn wait_ms() -> u32 {
-    static W: OnceLock<u32> = OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("XCL_BOTTOM_PIPE_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(WAIT_MS)
+fn worker_event() -> usize {
+    static EVENT: OnceLock<usize> = OnceLock::new();
+    *EVENT.get_or_init(|| unsafe {
+        let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize;
+        if event == 0 {
+            crate::xlog_error!("D3D12.X: could not create the bottom-of-pipe completion event");
+            return 0;
+        }
+        let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || complete_jobs(event));
+        if let Err(e) = spawned {
+            crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
+            windows_sys::Win32::Foundation::CloseHandle(event as _);
+            return 0;
+        }
+        event
     })
 }
 
-fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
-    static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-    W.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
-            let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-            let timeout = wait_ms();
-            for job in rx {
-                let mut timed_out = false;
-                if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, timeout);
-                    if job.fence.GetCompletedValue() < job.value {
-                        timed_out = true;
-                        static LATE: AtomicU64 = AtomicU64::new(0);
-                        let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
-                        if k.is_power_of_two() {
-                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {timeout} ms (fence at {}, wanted {}; {} writes)", job.fence.GetCompletedValue(), job.value, job.writes.len());
-                        }
-                    }
-                }
-                for w in &job.writes {
-                    match w {
-                        Write::Immediate(va, words) => write_now(*va, words),
-                        Write::ReadbackU64 { va, src, .. } => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
-                            write_u64_now(*va, value);
-                        }
-                        Write::Copy { dst, src, len } => copy_now(*dst, *src, *len),
-                    }
-                }
-                if timed_out {
-                    let _ = job.fence.Signal(job.value);
-                    if crate::util::mac_host() || cfg!(test) {
-                        super::fence_x::rescue_stalled_title_fences(job.queue);
+unsafe fn complete_jobs(event: usize) {
+    let mut pending: Vec<Job> = Vec::new();
+    let mut completed = HashMap::new();
+    let mut stalled = HashSet::new();
+    loop {
+        for job in std::mem::take(&mut *INCOMING.lock().unwrap()) {
+            if job.fence.GetCompletedValue() < job.value {
+                let _ = job.fence.SetEventOnCompletion(job.value, HANDLE(event as _));
+            }
+            pending.push(job);
+        }
+        completed.clear();
+        stalled.clear();
+        pending.retain_mut(|job| {
+            // One sample per queue keeps its writes in order if the fence advances mid-scan.
+            let done = *completed.entry(job.queue).or_insert_with(|| job.fence.GetCompletedValue());
+            if done == u64::MAX {
+                return false; // device removed: its readbacks are invalid
+            }
+            if done < job.value {
+                if stalled.insert(job.queue) && !job.warned && job.submitted.elapsed() >= STALL_AFTER {
+                    job.warned = true;
+                    crate::xlog_warn!("D3D12.X: bottom-of-pipe writes still pending (fence at {done}, wanted {}; {} writes)", job.value, job.writes.len());
+                    if super::list_x::trace_gpu_stall() {
                         super::list_x::log_gpu_stall(job.queue);
+                        for list in &job.lists {
+                            crate::xlog_warn!("D3D12.X: submission for fence {}: {list}", job.value);
+                        }
                     }
+                }
+                return true;
+            }
+            for w in &job.writes {
+                match w {
+                    Write::Immediate(va, words) => write_now(*va, words),
+                    Write::ReadbackU64 { va, src, .. } => {
+                        let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                        write_u64_now(*va, value);
+                    }
+                    Write::Copy { dst, src, len } => copy_now(*dst, *src, *len),
                 }
             }
+            false
         });
-        if let Err(e) = spawned {
-            crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
-        }
-        Mutex::new(tx)
-    })
+        // Both new jobs and GPU completion wake the worker. Poll if a host drops a fence event.
+        th::WaitForSingleObject(event as _, if pending.is_empty() { th::INFINITE } else { 100 });
+    }
+}
+
+fn enqueue(job: Job) {
+    let event = worker_event();
+    INCOMING.lock().unwrap().push(job);
+    if event != 0 {
+        unsafe { th::SetEvent(event as _) };
+    }
 }
 
 /// The dwords at `va`, if the memory is still there and writable.
@@ -178,12 +200,12 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
 }
 
 /// `writes` of lists just submitted to `queue`: done when the GPU has finished them.
-pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
+pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>, lists: Vec<String>) {
     if writes.is_empty() || queue.is_null() {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let job = {
+    {
         let mut g = FENCES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let entry = match m.entry(queue as usize) {
@@ -202,11 +224,11 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { queue: queue as usize, fence: entry.fence.clone(), value: entry.value, writes }
-    };
-    static FIRST: std::sync::Once = std::sync::Once::new();
-    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
-    let _ = worker().lock().unwrap().send(job);
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", writes.len()));
+        // Signal and enqueue under the same lock so concurrent submits cannot reorder the writes.
+        enqueue(Job { queue: queue as usize, fence: entry.fence.clone(), value: entry.value, writes, submitted: Instant::now(), warned: false, lists });
+    }
 }
 
 #[cfg(test)]
@@ -234,7 +256,7 @@ mod tests {
             let from = Box::new([0x1111_2222u32, 0x3333_4444, 0x5555_6666]);
             let to = Box::new([0u32; 3]);
             let (src, dst) = (from.as_ptr() as usize, to.as_ptr() as usize);
-            after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9]), Write::Copy { dst, src, len: 12 }]);
+            after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9]), Write::Copy { dst, src, len: 12 }], Vec::new());
             let t = std::time::Instant::now();
             while (*((dst + 8) as *const AtomicU32)).load(Ordering::Acquire) != 0x5555_6666 {
                 assert!(t.elapsed().as_secs() < 5, "never written");
@@ -242,6 +264,49 @@ mod tests {
             }
             assert_eq!(*cell, [7, 9]);
             assert_eq!(*to, *from);
+        }
+    }
+
+    #[test]
+    fn stalled_queue_keeps_writes_pending_without_blocking_other_queues() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let held: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(1, D3D12_FENCE_FLAG_NONE).unwrap();
+            let cell = || Box::leak(Box::new(AtomicU32::new(0))) as &AtomicU32;
+            let first = cell();
+            let second = cell();
+            let job = |fence: &ID3D12Fence, at: &AtomicU32| Job {
+                queue: fence.as_raw() as usize,
+                fence: fence.clone(),
+                value: 1,
+                writes: vec![Write::Immediate(at.as_ptr() as usize, vec![1])],
+                submitted: Instant::now() - STALL_AFTER,
+                warned: false,
+                lists: Vec::new(),
+            };
+            enqueue(job(&held, first));
+            enqueue(job(&done, second));
+            let wait = |at: &AtomicU32| {
+                let start = Instant::now();
+                while at.load(Ordering::Acquire) == 0 && start.elapsed() < Duration::from_secs(2) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                at.load(Ordering::Acquire)
+            };
+            let second_completed = wait(second);
+            let first_before_completion = first.load(Ordering::Acquire);
+            let fence_before_completion = held.GetCompletedValue();
+            held.Signal(1).unwrap();
+            assert_eq!(wait(first), 1);
+            assert_eq!(second_completed, 1);
+            assert_eq!(first_before_completion, 0);
+            assert_eq!(fence_before_completion, 0);
         }
     }
 
@@ -288,7 +353,7 @@ mod tests {
             let dst = Box::new(0u64);
             let va = dst.as_ref() as *const u64 as usize;
             assert!(writable(va, 8));
-            after(q.as_raw(), vec![Write::ReadbackU64 { va, src: ptr as usize, _buf: rb }]);
+            after(q.as_raw(), vec![Write::ReadbackU64 { va, src: ptr as usize, _buf: rb }], Vec::new());
             let t = std::time::Instant::now();
             while (*(va as *const AtomicU64)).load(Ordering::Acquire) != expected {
                 assert!(t.elapsed().as_secs() < 5, "readback value never written");

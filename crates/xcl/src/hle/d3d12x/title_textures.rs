@@ -92,7 +92,6 @@ struct Entry {
     mapped: bool,
     /// the present count when it was made (unwatched: young textures have a turn of their own)
     made: u64,
-    small_target: bool,
 }
 
 /// textures waiting for their first upload
@@ -479,7 +478,6 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         cpu_unmapped: false,
         mapped: false,
         made: frame_now(),
-        small_target,
     };
     let to_unmap = {
         let mut t = TEXTURES.lock().unwrap();
@@ -911,16 +909,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     let mut todo = if on_mac { poll_unwatched() } else { Vec::new() };
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
-        if on_mac {
-            crate::gpu::texture::set_title_queue(queue as usize);
-        }
         upload_all(todo);
-        if on_mac {
-            if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-                crate::gpu::texture::sync_queue(q);
-            }
-            crate::gpu::texture::set_title_queue(0);
-        }
         return;
     }
     // textures made since the last submit and those with a written page; a reference each
@@ -928,89 +917,38 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let first: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        let upload_entry = |res: usize, e: &mut Entry| -> Option<(ID3D12Resource, Upload)> {
-            let r = clone_resource(res, on_mac && e.unwatched)?;
-            if e.pending {
-                e.pending = false;
-                PENDING.fetch_sub(1, Ordering::Relaxed);
-                if e.unwatched {
-                    // what goes up now is what later looks compare with
-                    e.sent = memory_hash(e.va, e.tex.size() as usize);
+        t.by_res
+            .iter_mut()
+            .filter(|(_, e)| {
+                if e.pending {
+                    return true;
                 }
-            }
-            let source = if on_mac { e.va } else { e.src };
-            Some((r, (e.device, source, Arc::clone(&e.tex), e.states.clone())))
-        };
-
-        if on_mac {
-            let mut results = Vec::new();
-            let mut submit_bytes = 0usize;
-            let mut submit_count = 0usize;
-
-            // Pass 1: Prioritize small_target UI/glyph textures and written dirty pages (non-pending)
-            for (&res, e) in t.by_res.iter_mut() {
                 if e.gpu_written || e.unwatched {
-                    continue;
+                    return false;
                 }
-                let is_dirty = {
-                    let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                    dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-                };
-                if (e.pending && e.small_target) || (!e.pending && is_dirty) {
-                    if let Some(up) = upload_entry(res, e) {
-                        results.push(up);
+                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
+                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+            })
+            .filter_map(|(&res, e)| {
+                // A pending unwatched texture can retry next submit if a Release is in flight.
+                let r = clone_resource(res, on_mac && e.unwatched)?;
+                if e.pending {
+                    e.pending = false;
+                    PENDING.fetch_sub(1, Ordering::Relaxed);
+                    if e.unwatched {
+                        // what goes up now is what later looks compare with
+                        e.sent = memory_hash(e.va, e.tex.size() as usize);
                     }
                 }
-            }
-
-            // Pass 2: Regular pending textures, subject to submit burst quota
-            for (&res, e) in t.by_res.iter_mut() {
-                if !e.pending || e.small_target || e.gpu_written || e.unwatched {
-                    continue;
-                }
-                let tex_size = e.tex.size() as usize;
-                if submit_bytes + tex_size > MAC_MAX_SUBMIT_UPLOAD_BYTES || submit_count >= MAC_MAX_SUBMIT_UPLOAD_COUNT {
-                    // Defer this pending texture to the next submit; leave e.pending = true
-                    continue;
-                }
-                if let Some(up) = upload_entry(res, e) {
-                    submit_bytes += tex_size;
-                    submit_count += 1;
-                    results.push(up);
-                }
-            }
-
-            results
-        } else {
-            t.by_res
-                .iter_mut()
-                .filter(|(_, e)| {
-                    if e.pending {
-                        return true;
-                    }
-                    if e.gpu_written || e.unwatched {
-                        return false;
-                    }
-                    let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                    dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-                })
-                .filter_map(|(&res, e)| upload_entry(res, e))
-                .collect()
-        }
+                let source = if on_mac { e.va } else { e.src };
+                Some((r, (e.device, source, Arc::clone(&e.tex), e.states.clone())))
+            })
+            .collect()
     });
     // (a texture in both lists goes once)
     todo.retain(|(r, _)| !first.iter().any(|(f, _)| f.as_raw() == r.as_raw()));
     todo.extend(first);
-    if on_mac {
-        crate::gpu::texture::set_title_queue(queue as usize);
-    }
     upload_all(todo);
-    if on_mac {
-        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-            crate::gpu::texture::sync_queue(q);
-        }
-        crate::gpu::texture::set_title_queue(0);
-    }
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -1349,35 +1287,19 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
         .collect()
 }
 
-/// Maximum items (textures) allowed in a single batch on Mac host to prevent
-/// Metal command buffer encoder overflow and barrier saturation.
-pub(crate) const MAC_MAX_BATCH_ITEMS: usize = 24;
+/// Cap both the staging bytes and the number of copies in a single upload list.
+const BATCH_BYTES: usize = 32 << 20;
+const BATCH_ITEMS: usize = 256;
 
-/// Maximum upload bytes deferred/processed in a single submit on Mac host (64 MiB).
-pub(crate) const MAC_MAX_SUBMIT_UPLOAD_BYTES: usize = 64 << 20;
-
-/// Maximum upload count deferred/processed in a single submit on Mac host (32 textures).
-pub(crate) const MAC_MAX_SUBMIT_UPLOAD_COUNT: usize = 32;
-
-/// staging bytes of one batch at most.
-/// On Mac host (D3DMetal), reduced from 256 MiB to 32 MiB (or `XCL_TEXTURE_BATCH_BYTES`)
-/// to prevent Metal command buffer / barrier saturation, GPU blit timeouts, and device removal (0x887A0005).
-#[inline]
-pub(crate) fn batch_bytes_limit() -> usize {
-    if crate::util::mac_host() {
-        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *LIMIT.get_or_init(|| {
-            std::env::var("XCL_TEXTURE_BATCH_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(32 << 20)
-        })
-    } else {
-        256 << 20
-    }
+/// An empty batch accepts its first texture even if it exceeds the byte cap.
+fn batch_fits(count: usize, bytes: usize, device: usize, next_device: usize, next_bytes: usize) -> bool {
+    count == 0
+        || (count < BATCH_ITEMS
+            && device == next_device
+            && bytes.saturating_add(next_bytes) <= BATCH_BYTES)
 }
 
-/// The uploads `todo`, in batches of up to `batch_bytes_limit()` (one list and one wait each).
+/// The uploads `todo`, in bounded batches with one list and one wait each.
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
     if todo.is_empty() {
@@ -1401,15 +1323,12 @@ unsafe fn upload_batches(todo: Vec<(ID3D12Resource, Upload)>, warned: &AtomicU64
         }
     };
     let mut todo = todo.into_iter().peekable();
-    let batch_limit = batch_bytes_limit();
-    let on_mac = crate::util::mac_host();
     while todo.peek().is_some() {
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            let item_overflow = on_mac && picked.len() >= MAC_MAX_BATCH_ITEMS;
-            if !picked.is_empty() && (bytes + tex.size() as usize > batch_limit || *dev != device || item_overflow) {
+            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
@@ -1430,6 +1349,9 @@ unsafe fn upload_batches(todo: Vec<(ID3D12Resource, Upload)>, warned: &AtomicU64
             device = dev;
             bytes += tex.size() as usize;
             picked.push((r, va, tex, states));
+        }
+        if picked.is_empty() {
+            continue;
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
@@ -2175,7 +2097,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, unwatched: false, sent: 0, changed: 0, dynamic: false, cpu_unmapped: false, mapped: false, made: 0, small_target: false };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, unwatched: false, sent: 0, changed: 0, dynamic: false, cpu_unmapped: false, mapped: false, made: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -2331,7 +2253,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, unwatched: false, sent: 0, changed: 0, dynamic: false, cpu_unmapped: false, mapped: false, made: 0, small_target: false });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, unwatched: false, sent: 0, changed: 0, dynamic: false, cpu_unmapped: false, mapped: false, made: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -2598,7 +2520,6 @@ mod tests {
             cpu_unmapped: false,
             mapped: false,
             made: 0,
-            small_target: false,
         };
         let mut tbl = Table::new();
         // Two adjacent placed 16 KiB textures + one placed 64 KiB texture after them.
@@ -3035,107 +2956,14 @@ mod tests {
     }
 
     #[test]
-    fn mac_texture_batch_size_capped_at_safe_limit() {
-        assert_eq!(MAC_MAX_BATCH_ITEMS, 24);
-        assert_eq!(MAC_MAX_SUBMIT_UPLOAD_BYTES, 64 << 20);
-        assert_eq!(MAC_MAX_SUBMIT_UPLOAD_COUNT, 32);
-
-        let limit = batch_bytes_limit();
-        if crate::util::mac_host() {
-            let expected = std::env::var("XCL_TEXTURE_BATCH_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(32 << 20);
-            assert_eq!(limit, expected);
-        } else {
-            assert_eq!(limit, 256 << 20);
-        }
-    }
-
-    #[test]
-    fn pending_textures_burst_throttling_across_submits() {
-        let tex_1m = Arc::new(xg::Texture::new(&console_desc(3, 512, 512, 1, 1, 28, 0x105)).unwrap());
-        let tex_small = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
-
-        let entry = |va: usize, tex: &Arc<xg::Texture>, pending: bool, small_target: bool| Entry {
-            device: 0,
-            va,
-            src: va,
-            in_gpu_view: false,
-            tex: Arc::clone(tex),
-            states: vec![D3D12_RESOURCE_STATE_COMMON],
-            pending,
-            gpu_written: false,
-            placed: false,
-            unmapped: false,
-            seq: 0,
-            unwatched: false,
-            sent: 0,
-            changed: 0,
-            dynamic: false,
-            cpu_unmapped: false,
-            mapped: false,
-            made: 0,
-            small_target,
-        };
-
-        let mut tbl = Table::new();
-        // Insert 5 small_target UI glyph textures (pending = true)
-        for i in 0..5 {
-            tbl.insert(0x1000 + i, entry(0x1000 + i * 0x1000, &tex_small, true, true));
-        }
-        // Insert 40 regular large textures (pending = true)
-        for i in 0..40 {
-            tbl.insert(0x2000 + i, entry(0x20_0000 + i * 0x10_0000, &tex_1m, true, false));
-        }
-
-        assert_eq!(tbl.by_res.len(), 45);
-
-        if crate::util::mac_host() {
-            let mut submit_bytes = 0usize;
-            let mut submit_count = 0usize;
-            let mut uploaded = Vec::new();
-
-            // Pass 1: Prioritize small targets
-            for (&res, e) in tbl.by_res.iter_mut() {
-                if e.pending && e.small_target {
-                    e.pending = false;
-                    uploaded.push((res, true));
-                }
-            }
-            assert_eq!(uploaded.len(), 5, "all 5 small_targets uploaded in pass 1");
-
-            // Pass 2: Regular pending textures capped at MAC_MAX_SUBMIT_UPLOAD_COUNT (32)
-            for (&res, e) in tbl.by_res.iter_mut() {
-                if !e.pending || e.small_target {
-                    continue;
-                }
-                let tex_size = e.tex.size() as usize;
-                if submit_bytes + tex_size > MAC_MAX_SUBMIT_UPLOAD_BYTES || submit_count >= MAC_MAX_SUBMIT_UPLOAD_COUNT {
-                    continue;
-                }
-                submit_bytes += tex_size;
-                submit_count += 1;
-                e.pending = false;
-                uploaded.push((res, false));
-            }
-
-            assert_eq!(submit_count, 32, "exactly 32 large textures picked in submit 1");
-            assert_eq!(uploaded.len(), 37, "37 textures uploaded in submit 1 (5 small + 32 large)");
-
-            let still_pending = tbl.by_res.values().filter(|e| e.pending).count();
-            assert_eq!(still_pending, 8, "remaining 8 large textures remain pending for subsequent submit");
-
-            // Submit 2: picks remaining 8
-            let mut submit2_count = 0usize;
-            for e in tbl.by_res.values_mut() {
-                if e.pending {
-                    e.pending = false;
-                    submit2_count += 1;
-                }
-            }
-            assert_eq!(submit2_count, 8, "submit 2 clears remaining pending textures");
-            assert_eq!(tbl.by_res.values().filter(|e| e.pending).count(), 0);
-        }
+    fn batch_fits_caps_items_bytes_and_device() {
+        assert!(batch_fits(0, 0, 0, 1, BATCH_BYTES + 4096));
+        assert!(!batch_fits(1, BATCH_BYTES + 4096, 1, 1, 4096));
+        assert!(batch_fits(BATCH_ITEMS - 1, (BATCH_ITEMS - 1) * 4096, 1, 1, 4096));
+        assert!(!batch_fits(BATCH_ITEMS, BATCH_ITEMS * 4096, 1, 1, 4096));
+        assert!(batch_fits(1, BATCH_BYTES - 4096, 1, 1, 4096));
+        assert!(!batch_fits(1, BATCH_BYTES - 4096, 1, 1, 4097));
+        assert!(!batch_fits(1, usize::MAX - 10, 1, 1, 100));
+        assert!(!batch_fits(1, 4096, 1, 2, 4096));
     }
 }

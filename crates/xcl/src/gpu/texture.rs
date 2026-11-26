@@ -13,7 +13,6 @@
 use super::desc::{self, Image, ImageType};
 use super::fence;
 use super::tiling::{self, Chain, PipeConfig};
-use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
@@ -214,7 +213,6 @@ struct Uploader {
     value: u64,
     /// (buffer, its mapped bytes, capacity)
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
-    waited: std::collections::HashMap<usize, u64>,
 }
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
@@ -223,37 +221,19 @@ unsafe impl Send for Uploader {}
 /// queue (raw pointer) → its uploader, while no batch uses it
 static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploader>>> = std::sync::Mutex::new(None);
 
-/// Active title command queue raw pointer for GPU synchronization on Mac host
-static TITLE_QUEUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Set current title queue raw pointer for upload synchronization
-pub fn set_title_queue(q: usize) {
-    TITLE_QUEUE.store(q, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Current title queue raw pointer
-pub fn title_queue() -> usize {
-    TITLE_QUEUE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Ensure the calling title queue waits for any in-flight texture upload batches on the GPU
-/// without stalling the CPU (matching `sparse.rs:1694` and `vram.rs:603`).
-pub unsafe fn sync_queue(queue: &ID3D12CommandQueue) {
-    let key = windows::core::Interface::as_raw(queue) as usize;
-    let mut g = UPLOADERS.lock().unwrap();
-    if let Some(uploaders) = g.as_mut() {
-        for up in uploaders.values_mut() {
-            if up.value > 0 && up.waited.get(&key).copied().unwrap_or(0) < up.value {
-                let _ = queue.Wait(&up.fence, up.value);
-                up.waited.insert(key, up.value);
-            }
-        }
-    }
-}
-
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+
+fn staging_capacity(bytes: u64) -> Option<u64> {
+    const LARGE: u64 = 64 << 20;
+    const STEP: u64 = 16 << 20;
+    if bytes <= LARGE {
+        Some(bytes.max(STAGING_MIN).next_power_of_two())
+    } else {
+        bytes.checked_next_multiple_of(STEP)
+    }
+}
 
 impl Uploader {
     unsafe fn new(dev: &ID3D12Device) -> Result<Uploader, String> {
@@ -261,7 +241,7 @@ impl Uploader {
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        Ok(Uploader { alloc, list, fence, value: 0, staging: None, waited: std::collections::HashMap::new() })
+        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
     }
 
     /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
@@ -271,7 +251,10 @@ impl Uploader {
                 return Ok((b.clone(), *p));
             }
         }
-        let cap = bytes.max(STAGING_MIN).next_power_of_two();
+        let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+        // A cached uploader has passed its last copy fence. Return this reference before
+        // acquiring the replacement so the growth path does not keep two buffers itself.
+        drop(self.staging.take());
         let b = buffer(dev, cap)?;
         let mut p = std::ptr::null_mut();
         b.Map(0, None, Some(&mut p)).map_err(err)?;
@@ -313,10 +296,6 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         return Ok(failed);
     }
     let (staging, mapped) = up.staging(dev, total)?;
-    if crate::util::mac_host() && up.value > 0 && up.fence.GetCompletedValue() < up.value {
-        // Non-blocking pipeline: only wait if previous upload list on this uploader is still executing
-        let _ = fence::wait(&up.fence, up.value, dev, None, 5000);
-    }
     up.alloc.Reset().map_err(err)?;
     up.list.Reset(&up.alloc, None).map_err(err)?;
     for (k, l, base) in &planned {
@@ -328,43 +307,17 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
     queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    if crate::util::mac_host() {
-        // Non-blocking GPU synchronization via queue.Wait(&up.fence, up.value) on the title queue matching sparse.rs and vram.rs
-        let tq_raw = TITLE_QUEUE.load(std::sync::atomic::Ordering::Relaxed);
-        let p = tq_raw as *mut std::ffi::c_void;
-        let target: Option<&ID3D12CommandQueue> = if tq_raw != 0 {
-            ID3D12CommandQueue::from_raw_borrowed(&p)
-        } else {
-            None
-        };
-        let sync_q = target.unwrap_or(queue);
-        let q_key = sync_q.as_raw() as usize;
-        if up.waited.get(&q_key).copied().unwrap_or(0) < up.value {
-            let _ = sync_q.Wait(&up.fence, up.value);
-            up.waited.insert(q_key, up.value);
-        }
-    } else {
-        if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
-            // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
-            // uploader next time) – freeing them under the GPU removed the device
-            std::mem::forget(up);
-            return Err(copy_error(e));
-        }
+    if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
+        // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
+        // uploader next time) – freeing them under the GPU removed the device
+        std::mem::forget(up);
+        return Err(copy_error(e));
     }
     put_back(key, up);
     Ok(failed)
 }
 
-fn put_back(key: usize, mut up: Uploader) {
-    if crate::util::mac_host() {
-        const MAX_RETAINED_STAGING: u64 = 64 << 20;
-        if let Some((_, _, cap)) = up.staging {
-            if cap > MAX_RETAINED_STAGING {
-                // Release excessive staging memory back to unified memory after large burst
-                drop(up.staging.take());
-            }
-        }
-    }
+fn put_back(key: usize, up: Uploader) {
     UPLOADERS.lock().unwrap().get_or_insert_with(Default::default).insert(key, up);
 }
 
@@ -857,6 +810,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn large_staging_uses_sixteen_mib_growth_steps() {
+        let mib = 1 << 20;
+        assert_eq!(staging_capacity(1), Some(4 * mib));
+        assert_eq!(staging_capacity(33 * mib), Some(64 * mib));
+        assert_eq!(staging_capacity(64 * mib + 1), Some(80 * mib));
+        assert_eq!(staging_capacity(138_713_408), Some(144 * mib));
+        assert_eq!(staging_capacity(256 * mib + 1), Some(272 * mib));
+        assert_eq!(staging_capacity(u64::MAX), None);
+    }
+
+    #[test]
+    fn gpu_large_mixed_upload_keeps_tight_staging_and_exact_pixels() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory6};
+
+        unsafe {
+            if std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+                match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                    Ok(debug) => debug.EnableDebugLayer(),
+                    Err(error) => println!("D3D12 debug layer unavailable: {error}"),
+                }
+            }
+            let factory: IDXGIFactory6 = CreateDXGIFactory1().expect("DXGI factory");
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let selected = crate::gpu::adapter::candidates(&factory, &selector).into_iter().find_map(|(a, desc)| {
+                crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_11_0).ok().map(|dev| (dev, desc))
+            });
+            let Some((dev, desc)) = selected else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            println!("large upload adapter: {}", String::from_utf16_lossy(&desc.Description).trim_end_matches('\0'));
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let make = |width, height, format| {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: width, Height: height,
+                    DepthOrArraySize: 1, MipLevels: 1, Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+                };
+                let mut out = None::<ID3D12Resource>;
+                let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+                dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, SHADER_READ, None, &mut out).unwrap();
+                out.unwrap()
+            };
+            let pixels = |rows: usize, row_bytes: usize, seed: u8| {
+                let data = (0..rows * row_bytes).map(|i| (i as u8).wrapping_mul(31) ^ (i >> 13) as u8 ^ seed).collect();
+                vec![Subresource { depth: 1, rows, row_bytes, data }]
+            };
+            let rgba = (make(8192, 4096, DXGI_FORMAT_R8G8B8A8_UNORM), pixels(4096, 32768, 27), vec![SHADER_READ]);
+            let bc7 = (make(2048, 2048, DXGI_FORMAT_BC7_UNORM), pixels(512, 8192, 91), vec![SHADER_READ]);
+            let key = queue.as_raw() as usize;
+            let kept = || {
+                let guard = UPLOADERS.lock().unwrap();
+                let stage = guard.as_ref().unwrap()[&key].staging.as_ref().unwrap();
+                (stage.0.as_raw() as usize, stage.2)
+            };
+            let batch = [rgba, bc7];
+            assert!(upload_batch(&dev, &queue, &batch[..1]).unwrap().is_empty());
+            let first = kept();
+            let before = std::time::Instant::now();
+            assert!(upload_batch(&dev, &queue, &batch).unwrap().is_empty());
+            let growth = before.elapsed();
+            let grown = kept();
+            for (resource, bytes, _) in &batch {
+                assert!(read_back(&dev, &queue, resource, bytes) == *bytes, "mixed batch pixel mismatch");
+            }
+            let before = std::time::Instant::now();
+            assert!(upload_batch(&dev, &queue, &batch).unwrap().is_empty());
+            let repeat = before.elapsed();
+            let reused = kept();
+            for (resource, bytes, _) in &batch {
+                assert!(read_back(&dev, &queue, resource, bytes) == *bytes, "repeat pixel mismatch");
+            }
+            // Drop the test's large uploader after its last copy fence and readbacks have passed.
+            let uploader = UPLOADERS.lock().unwrap().as_mut().unwrap().remove(&key);
+            drop(uploader);
+            if let Ok(info) = dev.cast::<ID3D12InfoQueue>() {
+                let mut errors = 0;
+                for index in 0..info.GetNumStoredMessagesAllowedByRetrievalFilter() {
+                    let mut size = 0;
+                    info.GetMessage(index, None, &mut size).unwrap();
+                    let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+                    let msg = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    info.GetMessage(index, Some(msg), &mut size).unwrap();
+                    if matches!((*msg).Severity, D3D12_MESSAGE_SEVERITY_ERROR | D3D12_MESSAGE_SEVERITY_CORRUPTION) {
+                        errors += 1;
+                    }
+                }
+                println!("D3D12 debug errors or corruption messages: {errors}");
+                assert_eq!(errors, 0);
+            }
+            println!("large upload: request={} B first_capacity={} B grown_capacity={} B growth={growth:?} repeat={repeat:?} byte_exact=true",
+                (128 + 4) << 20, first.1, grown.1);
+            assert_eq!(first.1, 128 << 20);
+            assert_eq!(grown, reused, "the repeated batch must reuse the staging buffer");
+            assert_eq!(grown.1, 144 << 20, "staging for 132 MiB must fit the next large size class");
+        }
+    }
+
     /// Mean |level `k` - level `k - 1` scaled down 2×| per channel (0..255 scale) of a texture
     /// with `ch` channels of `cb` bytes (unorm); None when the sizes do not halve.
     fn mip_error(big: &Subresource, small: &Subresource, ch: usize, cb: usize) -> Option<f64> {
@@ -1117,39 +1171,4 @@ mod tests {
                 .clone()
         }
     }
-
-    #[test]
-    fn title_queue_registration_roundtrip() {
-        assert_eq!(title_queue(), 0);
-        set_title_queue(0xDEAD_BEEF);
-        assert_eq!(title_queue(), 0xDEAD_BEEF);
-        set_title_queue(0);
-        assert_eq!(title_queue(), 0);
-    }
-
-    #[test]
-    fn staging_retention_capacity_trim_on_mac_host() {
-        let Some((dev, queue)) = device() else {
-            return;
-        };
-        unsafe {
-            let key = windows::core::Interface::as_raw(&queue) as usize;
-            let mut up = Uploader::new(&dev).unwrap();
-            // Allocate 128 MiB staging capacity (> 64 MiB limit)
-            let _ = up.staging(&dev, 128 << 20).unwrap();
-            let cap_before = up.staging.as_ref().map(|s| s.2).unwrap_or(0);
-            assert!(cap_before >= 128 << 20);
-
-            put_back(key, up);
-
-            let taken = UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&key)).unwrap();
-            if crate::util::mac_host() {
-                // Under mac_host, staging capacity > 64 MiB is trimmed/dropped
-                assert!(taken.staging.is_none(), "staging buffer was trimmed on mac host");
-            } else {
-                assert!(taken.staging.is_some(), "windows host preserves staging buffer");
-            }
-        }
-    }
 }
-

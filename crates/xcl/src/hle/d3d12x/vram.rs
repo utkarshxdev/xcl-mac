@@ -600,7 +600,9 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-        let _ = queue.Wait(&pages.fence, pages.value);
+        if queue.Wait(&pages.fence, pages.value).is_ok() && super::list_x::trace_gpu_stall() {
+            super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
+        }
         pages.waited.insert(key, pages.value);
     }
 }

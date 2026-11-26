@@ -119,6 +119,7 @@ env XCL_TEXTURE_SKIP_UNCHANGED=0 XCL_NETWORK=0 wine64 xcl.exe run "C:\Games\Your
 | `XCL_COHERENT_HEAPS` | `0` (Off) | `1` (On) | Avoids write-watch page protection traps on coherent heaps |
 | `XCL_WATCHDOG_BYPASS` | Off | — | Enables recovery for recognized watchdog sites. Unknown traps still follow normal exception handling. |
 | `XCL_DSTORAGE_BCPACK_ACCEPT` | Off | — | Set to `1` to complete eligible BCPack requests with solid placeholder blocks. Texture decompression is required for the original pixels. |
+| `XCL_TRACE_GPU_STALL` | Off | `1` | Logs command lists, recent dispatches and pipeline IDs when a bottom-of-pipe fence stalls |
 | `XCL_FRAME_DUMP` | `0` | `0` | Dumps every Nth presented frame to disk with luminance telemetry |
 | `XCL_FRAME_DUMP_FROM` | `0` | `0` | Delays frame sampling until frame index N is reached |
 

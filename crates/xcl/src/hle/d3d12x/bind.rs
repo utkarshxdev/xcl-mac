@@ -616,6 +616,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         })();
         match run {
             Ok(groups) => {
+                super::list_x::note_stall_work(this, "mesh", pso, [x.into(), y.into(), z.into()]);
                 count(DRAWS);
                 static LOGGED: AtomicU64 = AtomicU64::new(0);
                 let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -694,6 +695,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             })();
             match run {
                 Ok(()) => {
+                    super::list_x::note_stall_work(this, "indirect mesh", pso, [args as u64, count_buf as u64, max.into()]);
                     count(DRAWS);
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
                     let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -733,6 +735,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
+        super::list_x::note_stall_work(this, "indirect PC", pso, [args as u64, count_buf as u64, max.into()]);
         return pc(this, sig, max, args, args_pc_off, count_buf, count_off);
     }
     if !mac && ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -770,6 +773,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     };
     match result {
         Ok(()) => {
+            super::list_x::note_stall_work(this, "indirect", pso, [args as u64, count_buf as u64, max.into()]);
             count(if gfx { DRAWS } else { DISPATCHES });
         }
         Err(e) => {
@@ -1346,6 +1350,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    super::list_x::note_stall_work(this, "dispatch", pso, [x.into(), y.into(), z.into()]);
     list.Dispatch(x, y, z);
     Ok(())
 }

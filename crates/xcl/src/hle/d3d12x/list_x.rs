@@ -17,7 +17,7 @@
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -578,6 +578,7 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    stall_work: VecDeque<StallWork>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
     pred_buf: Option<ID3D12Resource>,
     /// True while `pred_buf` is in `D3D12_RESOURCE_STATE_PREDICATION` on this open recording.
@@ -791,6 +792,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.clear_write64_signals();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.stall_work.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
@@ -1093,6 +1095,49 @@ static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+// Based on upstream xcl-dev/xcl#1983 (c4396e23). Also sampled when a bottom-of-pipe fence stalls.
+#[derive(Clone)]
+struct InternalWait {
+    what: &'static str,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex::new(None);
+
+pub(super) fn trace_gpu_stall() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_TRACE_GPU_STALL").is_ok_and(|v| v == "1"))
+}
+
+pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D12Fence, value: u64) {
+    let mut tracked = INTERNAL_WAITS.lock().unwrap();
+    let waits = tracked.get_or_insert_with(HashMap::new).entry(queue).or_default();
+    waits.retain(|w| unsafe { w.fence.GetCompletedValue() } < w.value);
+    if unsafe { fence.GetCompletedValue() } < value {
+        waits.push(InternalWait { what, fence: fence.clone(), value });
+    }
+}
+
+fn internal_waits_summary() -> String {
+    let snapshot = INTERNAL_WAITS.lock().unwrap().clone().unwrap_or_default();
+    let mut parts = Vec::new();
+    for (queue, waits) in snapshot {
+        for wait in waits {
+            let done = unsafe { wait.fence.GetCompletedValue() };
+            if done < wait.value {
+                parts.push(format!("q{} ({queue:#x}): {} fence {:p} needs {:#x}, done {done:#x}", queue_id(queue), wait.what, wait.fence.as_raw(), wait.value));
+            }
+        }
+    }
+    if parts.is_empty() { "none".into() } else { parts.join(", ") }
+}
+
+pub(super) fn log_gpu_stall(queue: usize) {
+    crate::xlog_warn!("D3D12.X: bottom-of-pipe producer q{} ({queue:#x}) stalled; XCL queue waits: {}", queue_id(queue), internal_waits_summary());
+    crate::xlog_warn!("D3D12.X: pending title fences during bottom-of-pipe stall: {}", super::fence_x::pending_summary());
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
@@ -1236,7 +1281,6 @@ pub(super) unsafe fn note_title_queue_wait(queue: usize, fence: usize, value: u6
     if queue == 0 || fence == 0 || value == 0 {
         return;
     }
-    super::fence_x::note_fence_queue(fence, queue);
     static LOGGED: AtomicU64 = AtomicU64::new(0);
     if once(&LOGGED, 8) {
         crate::xlog_info!("D3D12.X: title ID3D12CommandQueue::Wait on q{} fence {fence:#x} >= {value:#x}", queue_id(queue));
@@ -1254,7 +1298,6 @@ pub(super) unsafe fn note_title_queue_signal(queue: usize, fence: usize, value: 
     if queue == 0 || fence == 0 || value == 0 {
         return;
     }
-    super::fence_x::note_fence_queue(fence, queue);
     let mut g = SYNC_GRAPH.lock().unwrap();
     let graph = g.get_or_insert_with(SyncGraph::default);
     let seq = graph.next_seq(queue);
@@ -1456,46 +1499,14 @@ fn wake_sync_watchdog() {
             }
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
+                if trace_gpu_stall() {
+                    crate::xlog_warn!("D3D12.X: XCL queue waits during GPU wait timeout: {}", internal_waits_summary());
+                }
             }
         });
         pair
     });
     pair.1.notify_one();
-}
-
-static GPU_STALL_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Return the total number of GPU queue stalls observed and logged.
-pub fn gpu_stall_count() -> u64 {
-    GPU_STALL_COUNT.load(Ordering::Relaxed)
-}
-
-/// Summarize active XCL GPU queue waits on `queue` (or all queues if `queue == 0`).
-fn queue_waits_summary(queue: usize) -> String {
-    let g = SYNC_GRAPH.lock().unwrap();
-    let Some(graph) = g.as_ref() else { return "none".into() };
-    let mut parts = Vec::new();
-    for (&va, cell) in &graph.cells {
-        for aw in &cell.armed_waits {
-            if aw.waiting_queue == queue || queue == 0 {
-                parts.push(format!("{va:#x}(val={:#x},seq={})", aw.val, aw.wait_seq));
-            }
-        }
-    }
-    if parts.is_empty() {
-        "none".into()
-    } else {
-        parts.join(", ")
-    }
-}
-
-/// Log diagnostic information and record telemetry for a bottom-of-pipe GPU queue stall.
-pub(super) fn log_gpu_stall(queue: usize) {
-    let _count = GPU_STALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    let qid = queue_id(queue);
-    let waits = queue_waits_summary(queue);
-    crate::xlog_warn!("D3D12.X: bottom-of-pipe producer q{qid} ({queue:#x}) stalled; XCL queue waits: {waits}");
-    crate::xlog_warn!("D3D12.X: pending title fences during bottom-of-pipe stall: {}", super::fence_x::pending_summary());
 }
 
 unsafe fn queue_device_and_type(queue: *mut c_void) -> Option<(ID3D12Device, usize, D3D12_COMMAND_LIST_TYPE)> {
@@ -1940,6 +1951,45 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     }
 }
 
+#[derive(Debug)]
+struct StallWork {
+    kind: &'static str,
+    pso: usize,
+    parameters: [u64; 3],
+}
+
+/// Keep recent recorded operations per list; the submission takes a snapshot before list reuse.
+pub(super) fn note_stall_work(list: *mut c_void, kind: &'static str, pso: usize, parameters: [u64; 3]) {
+    if !trace_gpu_stall() {
+        return;
+    }
+    if let Some(state) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        if state.stall_work.len() == 16 {
+            state.stall_work.pop_front();
+        }
+        state.stall_work.push_back(StallWork { kind, pso, parameters });
+    }
+}
+
+fn stall_lists(lists: &[*mut c_void]) -> Vec<String> {
+    if !trace_gpu_stall() {
+        return Vec::new();
+    }
+    let g = LISTS.lock().unwrap();
+    let mut trace = Vec::new();
+    for &list in lists.iter().rev().take(24).rev() {
+        let Some(state) = g.as_ref().and_then(|m| m.get(&(list as usize))) else {
+            trace.push(format!("list {list:p} (untracked)"));
+            continue;
+        };
+        let work: Vec<_> = state.stall_work.iter().map(|w| {
+            format!("{} pso={:#x} params={:x?}", w.kind, w.pso, w.parameters)
+        }).collect();
+        trace.push(format!("list {list:p} type={:?} last PSO={:#x}; {}", state.list_type, state.bound_pso, work.join(", ")));
+    }
+    trace
+}
+
 /// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
     let writes: Vec<super::cpu_writes::Write> = {
@@ -1947,7 +1997,9 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
         let Some(m) = g.as_ref() else { return };
         lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
     };
-    super::cpu_writes::after(queue, writes);
+    if !writes.is_empty() {
+        super::cpu_writes::after(queue, writes, stall_lists(lists));
+    }
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -2882,7 +2934,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             super::sparse::readback_after_execute(q, &sparse_writes);
         }
     }
-    super::cpu_writes::after(q_raw, cpu_writes);
+    if !cpu_writes.is_empty() {
+        super::cpu_writes::after(q_raw, cpu_writes, stall_lists(&one));
+    }
 
     let target = if let Some((primary, _, reclaimed)) = kickoff_split {
         let (ended_early, pred_buf_obj, bindings_copy) = {
@@ -2913,6 +2967,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.clear_write64_signals();
             s.clear_waits();
             s.cpu_writes.clear();
+            s.stall_work.clear();
             s.bindings = bindings_copy;
         }
         primary
@@ -3512,6 +3567,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.clear_write64_signals();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.stall_work.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
@@ -3958,6 +4014,33 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn stalled_queue_summary_only_lists_incomplete_internal_waits() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let fence: ID3D12Fence = dev.unwrap().CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let queue = fence.as_raw() as usize;
+            note_internal_wait(queue, "test mapping", &fence, 3);
+            note_internal_wait(queue, "test upload", &fence, 4);
+            let summary = internal_waits_summary();
+            assert!(summary.contains("test mapping") && summary.contains("test upload"), "{summary}");
+
+            fence.Signal(3).unwrap();
+            let summary = internal_waits_summary();
+            assert!(!summary.contains("test mapping") && summary.contains("test upload"), "{summary}");
+
+            fence.Signal(4).unwrap();
+            assert!(!internal_waits_summary().contains("test upload"));
+            INTERNAL_WAITS.lock().unwrap().as_mut().unwrap().remove(&queue);
+        }
+    }
 
     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
     static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
@@ -5965,12 +6048,5 @@ mod tests {
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
         }
-    }
-
-    #[test]
-    fn test_gpu_stall_logging_and_telemetry() {
-        let before = gpu_stall_count();
-        log_gpu_stall(0x7f8aac917010);
-        assert_eq!(gpu_stall_count(), before + 1);
     }
 }
