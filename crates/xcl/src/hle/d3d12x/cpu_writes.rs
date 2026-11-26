@@ -44,6 +44,7 @@ pub fn copies() -> (u64, u64) {
 }
 
 struct Job {
+    queue: usize,
     fence: ID3D12Fence,
     value: u64,
     writes: Vec<Write>,
@@ -64,7 +65,17 @@ static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 
 /// how long the worker waits for one submission before writing anyway (a removed device, a
 /// queue that never gets there)
-const WAIT_MS: u32 = 10_000;
+const WAIT_MS: u32 = 4_000;
+
+fn wait_ms() -> u32 {
+    static W: OnceLock<u32> = OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("XCL_BOTTOM_PIPE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(WAIT_MS)
+    })
+}
 
 fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
     static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
@@ -72,14 +83,17 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
         let (tx, rx) = mpsc::channel::<Job>();
         let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
             let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let timeout = wait_ms();
             for job in rx {
+                let mut timed_out = false;
                 if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, WAIT_MS);
+                    th::WaitForSingleObject(event, timeout);
                     if job.fence.GetCompletedValue() < job.value {
+                        timed_out = true;
                         static LATE: AtomicU64 = AtomicU64::new(0);
                         let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
                         if k.is_power_of_two() {
-                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", job.fence.GetCompletedValue(), job.value, job.writes.len());
+                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {timeout} ms (fence at {}, wanted {}; {} writes)", job.fence.GetCompletedValue(), job.value, job.writes.len());
                         }
                     }
                 }
@@ -91,6 +105,13 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                             write_u64_now(*va, value);
                         }
                         Write::Copy { dst, src, len } => copy_now(*dst, *src, *len),
+                    }
+                }
+                if timed_out {
+                    let _ = job.fence.Signal(job.value);
+                    if crate::util::mac_host() || cfg!(test) {
+                        super::fence_x::rescue_stalled_title_fences(job.queue);
+                        super::list_x::log_gpu_stall(job.queue);
                     }
                 }
             }
@@ -181,7 +202,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        Job { queue: queue as usize, fence: entry.fence.clone(), value: entry.value, writes }
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));

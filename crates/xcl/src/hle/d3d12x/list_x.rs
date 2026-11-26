@@ -1236,6 +1236,7 @@ pub(super) unsafe fn note_title_queue_wait(queue: usize, fence: usize, value: u6
     if queue == 0 || fence == 0 || value == 0 {
         return;
     }
+    super::fence_x::note_fence_queue(fence, queue);
     static LOGGED: AtomicU64 = AtomicU64::new(0);
     if once(&LOGGED, 8) {
         crate::xlog_info!("D3D12.X: title ID3D12CommandQueue::Wait on q{} fence {fence:#x} >= {value:#x}", queue_id(queue));
@@ -1253,6 +1254,7 @@ pub(super) unsafe fn note_title_queue_signal(queue: usize, fence: usize, value: 
     if queue == 0 || fence == 0 || value == 0 {
         return;
     }
+    super::fence_x::note_fence_queue(fence, queue);
     let mut g = SYNC_GRAPH.lock().unwrap();
     let graph = g.get_or_insert_with(SyncGraph::default);
     let seq = graph.next_seq(queue);
@@ -1459,6 +1461,41 @@ fn wake_sync_watchdog() {
         pair
     });
     pair.1.notify_one();
+}
+
+static GPU_STALL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Return the total number of GPU queue stalls observed and logged.
+pub fn gpu_stall_count() -> u64 {
+    GPU_STALL_COUNT.load(Ordering::Relaxed)
+}
+
+/// Summarize active XCL GPU queue waits on `queue` (or all queues if `queue == 0`).
+fn queue_waits_summary(queue: usize) -> String {
+    let g = SYNC_GRAPH.lock().unwrap();
+    let Some(graph) = g.as_ref() else { return "none".into() };
+    let mut parts = Vec::new();
+    for (&va, cell) in &graph.cells {
+        for aw in &cell.armed_waits {
+            if aw.waiting_queue == queue || queue == 0 {
+                parts.push(format!("{va:#x}(val={:#x},seq={})", aw.val, aw.wait_seq));
+            }
+        }
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Log diagnostic information and record telemetry for a bottom-of-pipe GPU queue stall.
+pub(super) fn log_gpu_stall(queue: usize) {
+    let _count = GPU_STALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let qid = queue_id(queue);
+    let waits = queue_waits_summary(queue);
+    crate::xlog_warn!("D3D12.X: bottom-of-pipe producer q{qid} ({queue:#x}) stalled; XCL queue waits: {waits}");
+    crate::xlog_warn!("D3D12.X: pending title fences during bottom-of-pipe stall: {}", super::fence_x::pending_summary());
 }
 
 unsafe fn queue_device_and_type(queue: *mut c_void) -> Option<(ID3D12Device, usize, D3D12_COMMAND_LIST_TYPE)> {
@@ -5928,5 +5965,12 @@ mod tests {
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
         }
+    }
+
+    #[test]
+    fn test_gpu_stall_logging_and_telemetry() {
+        let before = gpu_stall_count();
+        log_gpu_stall(0x7f8aac917010);
+        assert_eq!(gpu_stall_count(), before + 1);
     }
 }
