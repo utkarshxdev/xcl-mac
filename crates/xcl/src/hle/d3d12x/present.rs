@@ -52,16 +52,15 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
-    let token = (planes as *const u64).read_unaligned();
     let _present = PRESENTX_LOCK.lock().unwrap();
-    present_x_frame(queue, plane_count, planes);
-    // The title can use flip statistics to decide when to reuse its buffer.
-    // Queue our copy before reporting the flip.
-    super::frame::mark_flipped(token);
+    let tokens = present_x_frame(queue, plane_count, planes);
+    for token in tokens {
+        super::frame::mark_flipped(token);
+    }
     0
 }
 
-unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
+unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) -> Vec<u64> {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
@@ -81,37 +80,60 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
+    const RETAIL_PLANE_STRIDE: usize = 72;
     {
         // a change in the number of planes (the console's display composes them – a UI
         // plane over the game's): logged with the planes' raw words
         static LAST: AtomicU64 = AtomicU64::new(1);
         if LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
-            let n = 8 * plane_count as usize;
+            let n = (RETAIL_PLANE_STRIDE / 8) * plane_count as usize;
             let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() };
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
-    const RETAIL_PLANE_STRIDE: usize = 72;
     let mut chosen_res = 0;
+    let mut chosen_plane: Option<usize> = None;
+    let mut best_area: u64 = 0;
+    let mut tokens = Vec::with_capacity(plane_count as usize);
     for i in 0..plane_count as usize {
         let p = planes.add(i * RETAIL_PLANE_STRIDE);
         if !crate::gpu::shader::readable(p as usize, 0x18) {
             continue;
+        }
+        let token = (p as *const u64).read_unaligned();
+        if token != 0 && !tokens.contains(&token) {
+            tokens.push(token);
         }
         let count = (p.add(8) as *const u32).read_unaligned();
         let list = (p.add(0x10) as *const usize).read_unaligned();
         if count > 0 && crate::gpu::shader::readable(list, 8) {
             let res = (list as *const usize).read_unaligned();
             if res != 0 {
-                chosen_res = res;
-                if backbuffer_like(res).is_some() {
-                    break;
+                if let Some(desc) = backbuffer_like(res) {
+                    let area = desc.Width as u64 * desc.Height as u64;
+                    // Prefer post-video 3D world backbuffer on Plane 1 over Plane 0 video surface,
+                    // even when dynamic resolution scaling (e.g. 1440p) produces a smaller area than a 4K video.
+                    // Also guard against secondary overlays (Plane 2+) displacing Plane 1.
+                    let should_select = match chosen_plane {
+                        None => true,
+                        Some(0) => true,
+                        Some(1) => false,
+                        Some(_) => area > best_area,
+                    };
+                    if should_select {
+                        best_area = area;
+                        chosen_res = res;
+                        chosen_plane = Some(i);
+                    }
+                } else if chosen_res == 0 {
+                    chosen_res = res;
+                    chosen_plane = Some(i);
                 }
             }
         }
     }
     if chosen_res == 0 || !enabled() {
-        return;
+        return tokens;
     }
     let res = chosen_res;
     {
@@ -146,6 +168,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         }
     }
     present_now(Duration::ZERO, Some((queue as usize, res)));
+    tokens
 }
 
 thread_local! {
@@ -257,6 +280,20 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
+    if res == 0 || (res & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(res, 8) {
+        return None;
+    }
+    let vtable = *(res as *const usize);
+    // ID3D12Resource_Vtbl has GetDesc at slot 10 (offset 80..88). Vtable must be readable for at least 88 bytes.
+    const GET_DESC_SLOT: usize = 10;
+    const VTABLE_MIN_READABLE: usize = (GET_DESC_SLOT + 1) * std::mem::size_of::<usize>();
+    if vtable == 0 || (vtable & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(vtable, VTABLE_MIN_READABLE) {
+        return None;
+    }
+    let get_desc = *((vtable as *const usize).add(GET_DESC_SLOT));
+    if get_desc == 0 || (get_desc & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(get_desc, 1) {
+        return None;
+    }
     let raw = res as *mut c_void;
     let r = ID3D12Resource::from_raw_borrowed(&raw)?;
     let d = r.GetDesc();
@@ -1117,6 +1154,80 @@ mod tests {
             std::env::set_var("XCL_WINDOW_POS", "center");
             assert_eq!(window_position("auto", 1280, 720), window_position("center", 1280, 720));
             std::env::remove_var("XCL_WINDOW_POS");
+        }
+    }
+
+    #[test]
+    fn backbuffer_like_guards_against_invalid_pointers_and_vtables() {
+        unsafe {
+            // Null pointer
+            assert!(backbuffer_like(0).is_none());
+            // Misaligned pointer
+            assert!(backbuffer_like(0x1001).is_none());
+            assert!(backbuffer_like(0x1003).is_none());
+            // Unmapped address
+            assert!(backbuffer_like(0xDEAD_BEEF_0000).is_none());
+
+            // Readable memory with null vtable
+            let dummy_vtable: usize = 0;
+            let dummy_obj: *const usize = &dummy_vtable;
+            assert!(backbuffer_like(dummy_obj as usize).is_none());
+
+            // Readable memory with misaligned vtable
+            let misaligned_vtable: usize = 0x7FFF_0001;
+            let dummy_obj_misaligned: *const usize = &misaligned_vtable;
+            assert!(backbuffer_like(dummy_obj_misaligned as usize).is_none());
+
+            // Readable memory with unmapped vtable
+            let unmapped_vtable: usize = 0xDEAD_CAFE_0000;
+            let dummy_obj_unmapped: *const usize = &unmapped_vtable;
+            assert!(backbuffer_like(dummy_obj_unmapped as usize).is_none());
+
+            // Readable vtable but truncated (less than 88 bytes, e.g. 64 bytes)
+            let truncated_vtable = [0usize; 8];
+            let vtable_ptr: usize = truncated_vtable.as_ptr() as usize;
+            let dummy_obj_truncated: *const usize = &vtable_ptr;
+            assert!(backbuffer_like(dummy_obj_truncated as usize).is_none());
+
+            // Readable vtable (>= 88 bytes) but null GetDesc function pointer at slot 10
+            let mut vtable_with_null_fn = [0usize; 15];
+            vtable_with_null_fn[10] = 0;
+            let vtable_ptr2: usize = vtable_with_null_fn.as_ptr() as usize;
+            let dummy_obj_null_fn: *const usize = &vtable_ptr2;
+            assert!(backbuffer_like(dummy_obj_null_fn as usize).is_none());
+
+            // Readable vtable with misaligned GetDesc function pointer
+            let mut vtable_with_misaligned_fn = [0usize; 15];
+            vtable_with_misaligned_fn[10] = 0x7FFF_0001;
+            let vtable_ptr3: usize = vtable_with_misaligned_fn.as_ptr() as usize;
+            let dummy_obj_misaligned_fn: *const usize = &vtable_ptr3;
+            assert!(backbuffer_like(dummy_obj_misaligned_fn as usize).is_none());
+        }
+    }
+
+    #[test]
+    fn present_x_deduplicates_tokens_and_handles_retail_plane_stride() {
+        unsafe {
+            // Test null or unreadable planes
+            assert_eq!(present_x(std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null()), 0);
+            assert_eq!(present_x(std::ptr::null_mut(), 2, std::ptr::null(), std::ptr::null()), 0);
+
+            // Construct 2 planes packed with 72-byte RetailPlane stride
+            const RETAIL_PLANE_STRIDE: usize = 72;
+            let mut plane_data = vec![0u8; RETAIL_PLANE_STRIDE * 2];
+            // Plane 0: token = 0x100, count = 0
+            *(plane_data.as_mut_ptr() as *mut u64) = 0x100;
+            // Plane 1: token = 0x100 (duplicate token), count = 0
+            *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE) as *mut u64) = 0x100;
+
+            let tokens = present_x_frame(std::ptr::null_mut(), 2, plane_data.as_ptr());
+            // Token 0x100 should be deduplicated
+            assert_eq!(tokens, vec![0x100]);
+
+            // Plane 1 with distinct token = 0x200
+            *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE) as *mut u64) = 0x200;
+            let tokens2 = present_x_frame(std::ptr::null_mut(), 2, plane_data.as_ptr());
+            assert_eq!(tokens2, vec![0x100, 0x200]);
         }
     }
 }

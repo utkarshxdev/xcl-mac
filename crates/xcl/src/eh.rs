@@ -154,7 +154,7 @@ pub fn install_crash_handler() {
             return;
         }
         WATCHDOG.store(
-            std::env::var_os("XCL_WATCHDOG_BYPASS").is_some_and(|v| v == "1")
+            std::env::var_os("XCL_WATCHDOG_BYPASS").is_none_or(|v| v != "0")
                 && std::env::var_os("XCL_TITLE_WATCHDOG").is_none_or(|v| v != "1"),
             Ordering::Release,
         );
@@ -580,17 +580,36 @@ unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostic
         ctx.Rip += 11;
         return true;
     }
-    // the fatal error / GPU hang watchdog (`mov dword ptr [0], 0x4d8bd421`): deliberate crash
-    // tripped when world-load decompression or background compute pipeline builds take >30s
-    if at(rip + 7, 5) == [0x21, 0xD4, 0x8B, 0x4D, 0xC3] {
+    // the fatal error / GPU hang watchdog (`mov dword ptr [0], 0x4d8bd421` or null write at 0x23cf683): deliberate crash
+    // tripped when world-load decompression or background compute pipeline builds take >20-30s
+    let is_gpu_hang = at(rip + 7, 4) == [0x21, 0xD4, 0x8B, 0x4D];
+    let is_null_crash = at(rip + 7, 4) == [0, 0, 0, 0];
+    let is_watchdog_site = (rip & 0xFFF) == 0x683;
+    if (is_gpu_hang || is_null_crash) && (at(rip + 11, 1) == [0xC3] || is_watchdog_site || is_gpu_hang) {
         let n = SEEN.fetch_add(1, Ordering::Relaxed);
         if n < 4 || n.is_power_of_two() {
             crate::log::try_write(crate::log::Level::Warn,
-                format_args!("the title's fatal error / GPU hang watchdog triggered (#{n}: 0x4d8bd421 at rip={rip:#x}); resuming at the existing RET"));
+                format_args!("the title's fatal error / GPU hang watchdog triggered (#{n}: crash checkpoint at rip={rip:#x}); resuming execution"));
         }
-        // Let the existing RET execute with the title's stack and unwind state intact.
-        ctx.Rip += 11;
-        return true;
+        // Let the existing RET execute with the title's stack and unwind state intact,
+        // or pop the caller return address if a crash-helper trap follows the store.
+        if at(rip + 11, 1) == [0xC3] {
+            ctx.Rip += 11;
+            return true;
+        } else if at(rip + 11, 1) == [0xCC] || (crate::gpu::shader::readable(rip + 11, 2) && at(rip + 11, 2) == [0x0F, 0x0B]) {
+            if crate::gpu::shader::readable(ctx.Rsp as usize, 8) {
+                let ret_addr = (ctx.Rsp as *const usize).read_unaligned();
+                if crate::gpu::shader::readable(ret_addr, 1) {
+                    ctx.Rsp += 8;
+                    ctx.Rip = ret_addr as u64;
+                    return true;
+                }
+            }
+            return false;
+        } else {
+            ctx.Rip += 11;
+            return true;
+        }
     }
     // the watchdog: `mov r14, rsi; mov ebx, ebp` 0x29 bytes before, `mov r15, [rip+..]; mov r14, rsi;
     // mov ebp, 0x1e` (the path taken when no slot is stale) 0x42 bytes before
@@ -1755,12 +1774,67 @@ mod tests {
             ctx.Rip = code as u64;
             assert!(title_watchdog_resume(&mut ctx));
             assert_eq!(ctx.Rip as usize, code + 11);
+
+            // Null-store crash at 0x23cf683 watchdog checkpoint (mov dword ptr [0], 0; ret)
+            let null_insn = [0xC7u8, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0xC3];
+            std::ptr::copy_nonoverlapping(null_insn.as_ptr(), code as *mut u8, null_insn.len());
+            ctx.Rip = code as u64;
+            assert!(title_watchdog_resume(&mut ctx));
+            assert_eq!(ctx.Rip as usize, code + 11);
+
             // A trap after the store is not a proven leaf return. In particular, this
             // context has no valid stack address that could be read to synthesize a RET.
             (code as *mut u8).add(11).write(0xCC);
             ctx.Rip = code as u64;
+            ctx.Rsp = 0;
             assert!(!title_watchdog_resume(&mut ctx));
             assert_eq!((ctx.Rip, ctx.Rsp), (code as u64, 0));
+
+            // With page offset 0x683 (game_scarlett_master.exe+0x23cf683) and a readable stack return address,
+            // the watchdog resumption cleanly pops the caller return address.
+            let caller_ret: usize = code + 0x200; // code page is readable executable
+            let mut stack_slot = caller_ret;
+            ctx.Rip = (code + 0x683) as u64;
+            ctx.Rsp = &mut stack_slot as *mut usize as u64;
+            let site_683 = code + 0x683;
+            let trap_insn = [0xC7u8, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0xCC];
+            std::ptr::copy_nonoverlapping(trap_insn.as_ptr(), site_683 as *mut u8, trap_insn.len());
+            assert!(title_watchdog_resume(&mut ctx));
+            assert_eq!(ctx.Rip, caller_ret as u64);
+            assert_eq!(ctx.Rsp, (&mut stack_slot as *mut usize as u64) + 8);
+
+            // With page offset 0x683 but an unreadable/null stack, watchdog resumption refuses to advance into trap
+            ctx.Rip = site_683 as u64;
+            ctx.Rsp = 0;
+            assert!(!title_watchdog_resume(&mut ctx));
+            assert_eq!((ctx.Rip, ctx.Rsp), (site_683 as u64, 0));
+
+            // GPU hang crash checkpoint (0x4d8bd421) followed by trap with readable stack return address
+            let hang_trap = [0xC7u8, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D, 0xCC];
+            std::ptr::copy_nonoverlapping(hang_trap.as_ptr(), code as *mut u8, hang_trap.len());
+            stack_slot = caller_ret;
+            ctx.Rip = code as u64;
+            ctx.Rsp = &mut stack_slot as *mut usize as u64;
+            assert!(title_watchdog_resume(&mut ctx));
+            assert_eq!(ctx.Rip, caller_ret as u64);
+            assert_eq!(ctx.Rsp, (&mut stack_slot as *mut usize as u64) + 8);
+
+            // GPU hang crash checkpoint (0x4d8bd421) followed by trap with null stack
+            ctx.Rip = code as u64;
+            ctx.Rsp = 0;
+            assert!(!title_watchdog_resume(&mut ctx));
+            assert_eq!((ctx.Rip, ctx.Rsp), (code as u64, 0));
+
+            // Watchdog checkpoint followed by UD2 (0x0F 0x0B) with readable stack return address
+            let ud2_insn = [0xC7u8, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0x0F, 0x0B];
+            std::ptr::copy_nonoverlapping(ud2_insn.as_ptr(), site_683 as *mut u8, ud2_insn.len());
+            stack_slot = caller_ret;
+            ctx.Rip = site_683 as u64;
+            ctx.Rsp = &mut stack_slot as *mut usize as u64;
+            assert!(title_watchdog_resume(&mut ctx));
+            assert_eq!(ctx.Rip, caller_ret as u64);
+            assert_eq!(ctx.Rsp, (&mut stack_slot as *mut usize as u64) + 8);
+
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
         }
     }

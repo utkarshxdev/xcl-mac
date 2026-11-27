@@ -683,10 +683,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 // executed again on a later submit.
                 let dispatch_result = (|| {
                     bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-                    pc(this, dispatch.as_raw() as usize, 1, packed.as_raw() as usize, 0, count_buf, count_off);
+                    fresh_indirect_arguments(this, || {
+                        pc(this, dispatch.as_raw() as usize, 1, packed.as_raw() as usize, 0, count_buf, count_off);
+                    });
                     emit_uav_barrier(list, Some(&res_buf));
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-                    pc(this, sig, 1, packed.as_raw() as usize, 16, count_buf, count_off);
+                    fresh_indirect_arguments(this, || {
+                        pc(this, sig, 1, packed.as_raw() as usize, 16, count_buf, count_off);
+                    });
                     emit_uav_barrier(list, Some(&res_buf));
                     Ok(())
                 })();
@@ -792,8 +796,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
 }
 
-/// XCL's own buffer for `fresh_indirect_arguments` (device, buffer): COMMON between its uses
-static ARGUMENT_ORDER: Mutex<Option<(usize, ID3D12Resource)>> = Mutex::new(None);
+/// XCL's own buffers for `fresh_indirect_arguments` cached per device (device -> buffer): COMMON between its uses
+static ARGUMENT_ORDER: Mutex<Option<std::collections::HashMap<usize, ID3D12Resource>>> = Mutex::new(None);
 
 /// `op` (an ExecuteIndirect on `list`) reading the arguments and count the list wrote before it.
 ///
@@ -825,7 +829,9 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
     list.GetDevice(&mut dev).ok()?;
     let dev = dev?;
     let mut g = ARGUMENT_ORDER.lock().unwrap();
-    if let Some((_, b)) = g.as_ref().filter(|(d, _)| *d == dev.as_raw() as usize) {
+    let map = g.get_or_insert_with(std::collections::HashMap::new);
+    let dev_key = dev.cast::<windows::core::IUnknown>().map_or(dev.as_raw() as usize, |u| u.as_raw() as usize);
+    if let Some(b) = map.get(&dev_key) {
         return Some(b.clone());
     }
     let desc = D3D12_RESOURCE_DESC {
@@ -847,7 +853,7 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
         return None;
     }
     let b = b?;
-    *g = Some((dev.as_raw() as usize, b.clone()));
+    map.insert(dev_key, b.clone());
     Some(b)
 }
 
@@ -2012,5 +2018,84 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(checked_mesh_groups(2, 2, 2, 8), Some(8));
         assert_eq!(checked_mesh_groups(3, 3, 1, 8), None);
         assert_eq!(checked_mesh_groups(u32::MAX, 2, 1, u32::MAX), None);
+    }
+
+    /// Dedicated unit test validating that translated indirect calls wrap execution with argument barriers.
+    #[test]
+    fn translated_indirect_calls_wrap_execution_with_argument_barriers() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        // 1. Untracked command list executes operation directly without emitting barriers
+        let untracked = 0x7300_0001usize as *mut c_void;
+        let mut executed = false;
+        unsafe {
+            fresh_indirect_arguments(untracked, || {
+                executed = true;
+            });
+        }
+        assert!(executed, "fresh_indirect_arguments must execute op for untracked list");
+
+        // 2. Tracked bundle list type bypasses barriers
+        let bundle = 0x7300_0002usize as *mut c_void;
+        unsafe { list_x::on_create(bundle, 0x1000, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE); }
+        executed = false;
+        unsafe {
+            fresh_indirect_arguments(bundle, || {
+                executed = true;
+            });
+        }
+        assert!(executed, "fresh_indirect_arguments must execute op for bundle");
+        list_x::on_release(bundle as usize);
+
+        // 3. Tracked compute list without device executes operation cleanly
+        let compute = 0x7300_0003usize as *mut c_void;
+        unsafe { list_x::on_create(compute, 0x1000, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE); }
+        executed = false;
+        unsafe {
+            fresh_indirect_arguments(compute, || {
+                executed = true;
+            });
+        }
+        assert!(executed, "fresh_indirect_arguments must execute op for compute list without device");
+        list_x::on_release(compute as usize);
+
+        // 4. For tracked direct/compute command list with GPU device, verify argument barrier wrapping
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                use windows::Win32::Graphics::Dxgi::*;
+                if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() {
+                    if let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() {
+                        let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+                    }
+                }
+            }
+            let Some(dev) = dev else { return };
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let raw = list.as_raw();
+            real::adopt(raw, real::Kind::CommandList);
+            list_x::on_create(raw, alloc.as_raw() as usize, 0, ty);
+
+            let mut op_ran = false;
+            fresh_indirect_arguments(raw, || {
+                op_ran = true;
+            });
+            assert!(op_ran, "wrapped indirect operation must execute");
+
+            // Verify order buffer is created and cached for the device with width 256
+            let order_buf = argument_order_buffer(&list);
+            assert!(order_buf.is_some(), "argument order buffer must be created for device");
+            let b = order_buf.unwrap();
+            assert_eq!(b.GetDesc().Width, 256, "argument order buffer width must be 256 bytes");
+
+            // Verify repeated call retrieves the same cached buffer
+            let order_buf2 = argument_order_buffer(&list);
+            assert_eq!(order_buf2.unwrap().as_raw(), b.as_raw(), "cached order buffer must be reused");
+
+            list.Close().unwrap();
+            list_x::on_release(raw as usize);
+        }
     }
 }

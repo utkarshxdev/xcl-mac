@@ -262,14 +262,27 @@ pub(super) struct Recorded {
     patches: Vec<Patch>,
 }
 
+fn indirect_rest() -> bool {
+    std::env::var("VICTORY_INDIRECT_REST")
+        .or_else(|_| std::env::var("XCL_INDIRECT_REST"))
+        .is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false") && (v == "1" || v.eq_ignore_ascii_case("true")))
+}
+
 impl Recorded {
     pub(super) unsafe fn finish_gpu(&self, list: &ID3D12GraphicsCommandList) {
         // A list can execute more than once. Leave the scratch resource in its creation state.
         transition(list, &self.arguments, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
-    pub(super) fn retain_and_clear(self, allocator: usize, _shadow: &mut [u8]) {
+    pub(super) fn retain_and_clear(self, allocator: usize, shadow: &mut [u8]) {
         retain_resource(allocator, self.arguments);
+        if indirect_rest() {
+            for p in self.patches {
+                if let Some(chunk) = shadow.get_mut(p.shadow..p.shadow + 4) {
+                    chunk.fill(0);
+                }
+            }
+        }
     }
 }
 
