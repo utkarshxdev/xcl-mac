@@ -79,6 +79,19 @@ impl Config {
     /// setting has a concrete value. Returns what came from the manifest (for the log).
     pub fn resolve(&mut self, manifest: Option<&crate::manifest::Manifest>) -> Vec<String> {
         let mut from = Vec::new();
+        if let Ok(d) = std::env::var("XCL_DEVICE_TYPE") {
+            let val = d.trim().to_ascii_lowercase();
+            if !val.is_empty() {
+                from.push(format!("device_type {val} (from XCL_DEVICE_TYPE)"));
+                self.device_type = val;
+            }
+        } else if let Ok(d) = std::env::var("XCL_CONSOLE") {
+            let val = d.trim().to_ascii_lowercase();
+            if !val.is_empty() {
+                from.push(format!("device_type {val} (from XCL_CONSOLE)"));
+                self.device_type = val;
+            }
+        }
         let series_s = self.is_series_s();
         // "Auto" / "Advanced" in xcl.toml: read in any case, as device_type and the manifest (#106)
         self.title_memory = self.title_memory.trim().to_ascii_lowercase();
@@ -234,7 +247,10 @@ impl Config {
     }
 
     pub fn is_series_s(&self) -> bool {
-        self.device_type.eq_ignore_ascii_case("lockhart") || self.device_type.eq_ignore_ascii_case("series s")
+        self.device_type.eq_ignore_ascii_case("lockhart")
+            || self.device_type.eq_ignore_ascii_case("series s")
+            || self.device_type.eq_ignore_ascii_case("series-s")
+            || self.device_type.eq_ignore_ascii_case("seriess")
     }
 
     /// Configured `D3D12_RAYTRACING_TIER` override for `CheckFeatureSupport(D3D12_OPTIONS5)`:
@@ -343,7 +359,7 @@ mod tests {
             lockhart_memory: Some("Advanced".into()),
             ..Default::default()
         };
-        for device in ["lockhart", "Series S"] {
+        for device in ["lockhart", "Series S", "series-s", "seriess"] {
             let mut c = Config { device_type: device.into(), ..Config::default() };
             c.resolve(Some(&manifest));
             assert_eq!((c.title_memory.as_str(), c.title_memory_mb), ("advanced", 8_192), "{device}");

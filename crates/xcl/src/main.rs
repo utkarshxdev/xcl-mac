@@ -59,6 +59,13 @@ fn main() {
             };
             xcl::launcher::run(&PathBuf::from(&args[1]), &rest)
         }
+        Some(target) if !target.starts_with('-') && (target.ends_with(".exe") || target.ends_with(".xvc") || std::path::Path::new(target).exists()) => {
+            let rest: Vec<String> = match args.iter().position(|a| a == "--") {
+                Some(i) => args[i + 1..].to_vec(),
+                None => args[1..].to_vec(),
+            };
+            xcl::launcher::run(&PathBuf::from(target), &rest)
+        }
         Some("inspect") if args.len() >= 2 => {
             let json = args.iter().any(|a| a == "--json");
             xcl::inspect::run(&PathBuf::from(&args[1]), json)
