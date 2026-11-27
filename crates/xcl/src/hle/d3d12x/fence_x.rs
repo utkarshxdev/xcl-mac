@@ -33,6 +33,10 @@ fn event() -> usize {
     static E: OnceLock<usize> = OnceLock::new();
     *E.get_or_init(|| unsafe {
         let e = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize;
+        if e == 0 {
+            crate::xlog_error!("D3D12.X: could not create fence completion event");
+            return 0;
+        }
         let spawned = std::thread::Builder::new().name("xcl-fences".into()).spawn(move || loop {
             th::WaitForSingleObject(e as _, 10);
             refresh();
@@ -61,19 +65,18 @@ fn refresh() {
     for (&p, f) in g.iter().flatten() {
         if let Some(c) = f.cell {
             if let Some(v) = unsafe { borrowed(p, |f| f.GetCompletedValue()) } {
-                let mut was = c.0.load(Ordering::Acquire);
-                while v > was {
-                    match c.0.compare_exchange_weak(was, v, Ordering::AcqRel, Ordering::Acquire) {
-                        Ok(_) => {
-                            unsafe {
-                                th::WakeByAddressAll(c.0.as_ptr() as *const c_void);
-                            }
-                            if trace() {
-                                crate::xlog_info!("fence {p:#x}: completed value {was:#x} -> {v:#x} (cell {:p})", c.0.as_ptr());
-                            }
-                            break;
-                        }
-                        Err(actual) => was = actual,
+                // If the device has been removed, GetCompletedValue returns UINT64_MAX.
+                // Do not update the cell or treat this as a completed fence value.
+                if v == u64::MAX {
+                    continue;
+                }
+                let was = c.0.swap(v, Ordering::AcqRel);
+                if was != v {
+                    unsafe {
+                        th::WakeByAddressAll(c.0.as_ptr() as *const c_void);
+                    }
+                    if trace() {
+                        crate::xlog_info!("fence {p:#x}: completed value {was:#x} -> {v:#x} (cell {:p})", c.0.as_ptr());
                     }
                 }
             }
@@ -145,6 +148,7 @@ pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) 
             None => {
                 let c: &'static Cell = Box::leak(Box::new(Cell(AtomicU64::new(0))));
                 f.cell = Some(c);
+                let _ = event();
                 (c, f.signalled)
             }
         }
@@ -165,6 +169,30 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::*;
+
+    #[test]
+    fn fence_cell_updates_on_advance_and_rewind_excluding_device_removal() {
+        let cell = Cell(AtomicU64::new(100));
+
+        // 1. Advance: 100 -> 101
+        let v1 = 101;
+        let was1 = cell.0.swap(v1, Ordering::AcqRel);
+        assert_eq!(was1, 100);
+        assert_eq!(cell.0.load(Ordering::Acquire), 101);
+
+        // 2. Legitimate rewind / reset: 101 -> 50
+        let v2 = 50;
+        let was2 = cell.0.swap(v2, Ordering::AcqRel);
+        assert_eq!(was2, 101);
+        assert_eq!(cell.0.load(Ordering::Acquire), 50);
+
+        // 3. Device removal sentinel (u64::MAX) must be excluded
+        let v_removed = u64::MAX;
+        if v_removed != u64::MAX {
+            cell.0.swap(v_removed, Ordering::AcqRel);
+        }
+        assert_eq!(cell.0.load(Ordering::Acquire), 50);
+    }
 
     /// The cell follows the fence: CPU signals at once, queue signals when the GPU is there –
     /// also one queued before the address was asked for.

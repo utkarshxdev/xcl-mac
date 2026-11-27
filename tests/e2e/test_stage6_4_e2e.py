@@ -124,6 +124,10 @@ class DisplayPlaneManager:
         plane_count = len(planes)
         chosen_idx, stride = self.select_plane(plane_count, env_override)
         chosen_plane = planes[chosen_idx] if chosen_idx < plane_count else planes[0]
+        # Graceful fallback to Plane 0 if chosen plane has null resource
+        if chosen_plane.res_ptr == 0 and chosen_idx != 0 and len(planes) > 0 and planes[0].res_ptr != 0:
+            chosen_plane = planes[0]
+            chosen_idx = 0
 
         config = (plane_count, stride, chosen_idx, chosen_plane.width, chosen_plane.height, chosen_plane.format)
         if config != self.last_config:
@@ -186,10 +190,13 @@ class CpuWritesAndFenceManager:
         return bytes(self.simulated_memory[page][offset:offset + size])
 
     def propagate_gpu_completion(self, fence_addr: int, gpu_completed_val: int) -> bool:
-        """Propagates real GPU completion monotonically and invokes WakeByAddressAll."""
+        """Propagates real GPU completion (excluding UINT64_MAX device-removal) and preserves legitimate rewinds, invoking WakeByAddressAll."""
+        UINT64_MAX = 0xFFFFFFFFFFFFFFFF
+        if gpu_completed_val == UINT64_MAX:
+            return False
         if fence_addr in self.title_fences:
             tf = self.title_fences[fence_addr]
-            if gpu_completed_val > tf.cell_val:
+            if gpu_completed_val != tf.cell_val:
                 tf.cell_val = gpu_completed_val
                 tf.wake_calls += 1
                 self.wake_calls.append(fence_addr)
@@ -201,17 +208,17 @@ class CpuWritesAndFenceManager:
         return 0
 
     def poll_background_fences(self, elapsed_ms: Any = BACKGROUND_POLL_INTERVAL_MS, gpu_completed_values: Optional[Dict[int, int]] = None) -> int:
-        """Simulates 10ms background periodic polling in xcl-fences advancing monotonically on real GPU completion."""
+        """Simulates 10ms background periodic polling in xcl-fences advancing on real GPU completion, excluding UINT64_MAX."""
         refreshed = 0
         if isinstance(elapsed_ms, dict):
             gpu_vals = elapsed_ms
         else:
             gpu_vals = gpu_completed_values or {addr: tf.signalled for addr, tf in self.title_fences.items()}
+        UINT64_MAX = 0xFFFFFFFFFFFFFFFF
         for addr, tf in self.title_fences.items():
             if tf.has_cell:
                 completed = gpu_vals.get(addr, tf.cell_val)
-                # Monotonic advance: v > was
-                if completed > tf.cell_val:
+                if completed != UINT64_MAX and completed != tf.cell_val:
                     tf.cell_val = completed
                     tf.wake_calls += 1
                     self.wake_calls.append(addr)
@@ -579,8 +586,19 @@ class TestStage64Tier1Features(unittest.TestCase):
         self.assertEqual(cfg1["active_plane"], 1)
         self.assertEqual(cfg1["width"], 2560)
 
+        # 4. Edge Case: If Plane 1 has null resource (res_ptr=0), fallback to Plane 0 to prevent black screen
+        plane1_null = RetailPlane(token=0x101, count=0, res_ptr=0, width=0, height=0, fmt=0)
+        p_fallback = plane_mgr.parse_and_present([plane0, plane1_null], env_override=1)
+        self.assertEqual(p_fallback["chosen_plane"], 0)
+        self.assertEqual(p_fallback["resource"], 0x10080DE0)
+
+        # 5. Edge Case: If plane_count == 1, env_override=1 falls back to Plane 0
+        p_single = plane_mgr.parse_and_present([plane0], env_override=1)
+        self.assertEqual(p_single["chosen_plane"], 0)
+        self.assertEqual(p_single["resource"], 0x10080DE0)
+
     def test_r1_periodic_10ms_background_fence_polling(self):
-        """R1.5: Verify 10ms background polling monotonically propagates real GPU completion with WakeByAddressAll."""
+        """R1.5: Verify 10ms background polling propagates real GPU completion with WakeByAddressAll, excludes UINT64_MAX, and handles rewinds."""
         mgr = CpuWritesAndFenceManager()
         tf = mgr.register_title_fence(0x6000013dc310, initial_val=100)
         mgr.note_queue_signal(0x6000013dc310, val=101)
@@ -591,11 +609,17 @@ class TestStage64Tier1Features(unittest.TestCase):
         self.assertEqual(tf.cell_val, 101)
         self.assertEqual(tf.wake_calls, 1)
 
-        # Monotonicity guard: a stale or lower GPU completed value (e.g. 99) never regresses cell
-        refreshed_stale = mgr.poll_background_fences(gpu_completed_values={0x6000013dc310: 99}, elapsed_ms=10)
-        self.assertEqual(refreshed_stale, 0)
-        self.assertEqual(tf.cell_val, 101)
-        self.assertEqual(tf.wake_calls, 1)
+        # Legitimate rewind / reset (e.g. to 50): cell is updated and waiters woken
+        refreshed_rewind = mgr.poll_background_fences(gpu_completed_values={0x6000013dc310: 50}, elapsed_ms=10)
+        self.assertEqual(refreshed_rewind, 1)
+        self.assertEqual(tf.cell_val, 50)
+        self.assertEqual(tf.wake_calls, 2)
+
+        # Device removal sentinel UINT64_MAX (0xFFFFFFFFFFFFFFFF) must be excluded
+        refreshed_removed = mgr.poll_background_fences(gpu_completed_values={0x6000013dc310: 0xFFFFFFFFFFFFFFFF}, elapsed_ms=10)
+        self.assertEqual(refreshed_removed, 0)
+        self.assertEqual(tf.cell_val, 50)
+        self.assertEqual(tf.wake_calls, 2)
 
     def test_r1_title_watchdog_crash_prevention(self):
         """R1.6: Verify GPU completion cleanly propagates before 20s game watchdog deadline."""

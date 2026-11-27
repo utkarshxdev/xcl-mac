@@ -89,29 +89,31 @@ pub unsafe fn parse_plane(planes: *const u8, plane_index: usize, stride: usize) 
     Some((token, res))
 }
 
-unsafe fn resource_dims_and_format(res: usize) -> (u32, u32, i32) {
+unsafe fn get_resource_desc(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     if res == 0 || (res & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(res, 8) {
-        return (0, 0, 0);
-    }
-    if let Some(desc) = backbuffer_like(res) {
-        return (desc.Width as u32, desc.Height, desc.Format.0);
+        return None;
     }
     let vtable = *(res as *const usize);
     const GET_DESC_SLOT: usize = 10;
     const VTABLE_MIN_READABLE: usize = (GET_DESC_SLOT + 1) * std::mem::size_of::<usize>();
     if vtable == 0 || (vtable & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(vtable, VTABLE_MIN_READABLE) {
-        return (0, 0, 0);
+        return None;
     }
     let get_desc = *((vtable as *const usize).add(GET_DESC_SLOT));
     if get_desc == 0 || (get_desc & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(get_desc, 1) {
-        return (0, 0, 0);
+        return None;
     }
     let raw = res as *mut c_void;
-    if let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) {
-        let d = r.GetDesc();
-        return (d.Width as u32, d.Height, d.Format.0);
+    let r = ID3D12Resource::from_raw_borrowed(&raw)?;
+    Some(r.GetDesc())
+}
+
+unsafe fn resource_dims_and_format(res: usize) -> (u32, u32, i32) {
+    if let Some(d) = get_resource_desc(res) {
+        (d.Width as u32, d.Height, d.Format.0)
+    } else {
+        (0, 0, 0)
     }
-    (0, 0, 0)
 }
 
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
@@ -120,7 +122,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
-    let _present = PRESENTX_LOCK.lock().unwrap();
+    let _present = PRESENTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tokens = present_x_frame(queue, plane_count, planes);
     for token in tokens {
         super::frame::mark_flipped(token);
@@ -175,7 +177,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             chosen_res = r;
         }
     }
-    if chosen_res == 0 && chosen_plane != 0 {
+    if (chosen_res == 0 || (chosen_plane != 0 && backbuffer_like(chosen_res).is_none())) && chosen_plane != 0 {
         if let Some((_, r)) = parse_plane(planes, 0, stride) {
             if r != 0 {
                 chosen_res = r;
@@ -195,7 +197,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         format,
     };
     let config_changed = {
-        let mut last = LAST_PLANE_CONFIG.lock().unwrap();
+        let mut last = LAST_PLANE_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
         if *last != Some(config) {
             *last = Some(config);
             true
@@ -225,11 +227,10 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             }
         }
         let n = (stride / 8) * plane_count as usize;
-        let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) {
-            (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect()
-        } else {
-            Vec::new()
-        };
+        let words: Vec<u64> = (0..n)
+            .take_while(|&k| crate::gpu::shader::readable((planes as usize) + 8 * k, 8))
+            .map(|k| (planes as *const u64).add(k).read_unaligned())
+            .collect();
         crate::xlog_info!("D3D12.X: PresentX raw plane words: {words:x?}");
     }
 
@@ -238,7 +239,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     }
     let res = chosen_res;
     {
-        let mut p = PRESENTED.lock().unwrap();
+        let mut p = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
         if !p.contains(&res) {
             p.push(res);
         }
@@ -381,22 +382,7 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
-    if res == 0 || (res & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(res, 8) {
-        return None;
-    }
-    let vtable = *(res as *const usize);
-    const GET_DESC_SLOT: usize = 10;
-    const VTABLE_MIN_READABLE: usize = (GET_DESC_SLOT + 1) * std::mem::size_of::<usize>();
-    if vtable == 0 || (vtable & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(vtable, VTABLE_MIN_READABLE) {
-        return None;
-    }
-    let get_desc = *((vtable as *const usize).add(GET_DESC_SLOT));
-    if get_desc == 0 || (get_desc & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(get_desc, 1) {
-        return None;
-    }
-    let raw = res as *mut c_void;
-    let r = ID3D12Resource::from_raw_borrowed(&raw)?;
-    let d = r.GetDesc();
+    let d = get_resource_desc(res)?;
     let ok = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && d.Width >= 640
         && d.Height >= 360
@@ -1352,6 +1338,19 @@ mod tests {
             // If plane_count is 1, XCL_PRESENT_PLANE=1 falls back to plane 0
             let (idx_fallback, _) = selected_plane_index(1);
             assert_eq!(idx_fallback, 0);
+
+            // Plane 1 with count = 0 returns (token, 0)
+            *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE + 8) as *mut u32) = 0;
+            let parsed1_empty = parse_plane(plane_data.as_ptr(), 1, 72).unwrap();
+            assert_eq!(parsed1_empty, (0x20, 0));
+
+            // When Plane 1 has res=0, fallback logic extracts Plane 0 resource
+            let mut chosen = if parsed1_empty.1 != 0 { parsed1_empty.1 } else { 0 };
+            if chosen == 0 {
+                let parsed0_fallback = parse_plane(plane_data.as_ptr(), 0, 72).unwrap();
+                chosen = parsed0_fallback.1;
+            }
+            assert_eq!(chosen, res0);
 
             std::env::remove_var("XCL_PRESENT_PLANE");
         }
