@@ -46,22 +46,89 @@ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static PRESENTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 
+pub const RETAIL_PLANE_STRIDE: usize = 72;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PlaneConfigState {
+    plane_count: u32,
+    stride: usize,
+    active_plane: usize,
+    width: u32,
+    height: u32,
+    format: i32,
+}
+
+static LAST_PLANE_CONFIG: Mutex<Option<PlaneConfigState>> = Mutex::new(None);
+
+pub fn selected_plane_index(plane_count: u32) -> (usize, usize) {
+    let stride = if plane_count >= 2 { RETAIL_PLANE_STRIDE } else { 72 };
+    let req = std::env::var("XCL_PRESENT_PLANE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let chosen = if req == 1 && plane_count >= 2 { 1 } else { 0 };
+    (chosen, stride)
+}
+
+pub unsafe fn parse_plane(planes: *const u8, plane_index: usize, stride: usize) -> Option<(u64, usize)> {
+    if planes.is_null() {
+        return None;
+    }
+    let p = planes.add(plane_index * stride);
+    if !crate::gpu::shader::readable(p as usize, 0x18) {
+        return None;
+    }
+    let token = (p as *const u64).read_unaligned();
+    let count = (p.add(8) as *const u32).read_unaligned();
+    let list = (p.add(0x10) as *const usize).read_unaligned();
+    let res = if count > 0 && crate::gpu::shader::readable(list, 8) {
+        (list as *const usize).read_unaligned()
+    } else {
+        0
+    };
+    Some((token, res))
+}
+
+unsafe fn resource_dims_and_format(res: usize) -> (u32, u32, i32) {
+    if res == 0 || (res & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(res, 8) {
+        return (0, 0, 0);
+    }
+    if let Some(desc) = backbuffer_like(res) {
+        return (desc.Width as u32, desc.Height, desc.Format.0);
+    }
+    let vtable = *(res as *const usize);
+    const GET_DESC_SLOT: usize = 10;
+    const VTABLE_MIN_READABLE: usize = (GET_DESC_SLOT + 1) * std::mem::size_of::<usize>();
+    if vtable == 0 || (vtable & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(vtable, VTABLE_MIN_READABLE) {
+        return (0, 0, 0);
+    }
+    let get_desc = *((vtable as *const usize).add(GET_DESC_SLOT));
+    if get_desc == 0 || (get_desc & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(get_desc, 1) {
+        return (0, 0, 0);
+    }
+    let raw = res as *mut c_void;
+    if let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) {
+        let d = r.GetDesc();
+        return (d.Width as u32, d.Height, d.Format.0);
+    }
+    (0, 0, 0)
+}
+
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
-    let token = (planes as *const u64).read_unaligned();
     let _present = PRESENTX_LOCK.lock().unwrap();
-    present_x_frame(queue, plane_count, planes);
-    // The title can use flip statistics to decide when to reuse its buffer.
-    // Queue our copy before reporting the flip.
-    super::frame::mark_flipped(token);
+    let tokens = present_x_frame(queue, plane_count, planes);
+    for token in tokens {
+        super::frame::mark_flipped(token);
+    }
     0
 }
 
-unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
+unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) -> Vec<u64> {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
@@ -81,25 +148,95 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
-    {
-        // a change in the number of planes (the console's display composes them – a UI
-        // plane over the game's): logged with the planes' raw words
-        static LAST: AtomicU64 = AtomicU64::new(1);
-        if LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
-            let n = 8 * plane_count as usize;
-            let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() };
-            crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
+
+    let (chosen_plane, stride) = selected_plane_index(plane_count);
+
+    let mut tokens = Vec::with_capacity(plane_count as usize);
+    for i in 0..plane_count as usize {
+        let p = planes.add(i * stride);
+        if crate::gpu::shader::readable(p as usize, 8) {
+            let token = (p as *const u64).read_unaligned();
+            if token != 0 && !tokens.contains(&token) {
+                tokens.push(token);
+            }
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
-        return;
+    if tokens.is_empty() && crate::gpu::shader::readable(planes as usize, 8) {
+        let token = (planes as *const u64).read_unaligned();
+        if token != 0 {
+            tokens.push(token);
+        }
     }
-    let res = (list as *const usize).read_unaligned();
-    if res == 0 {
-        return;
+
+    let mut chosen_res = 0;
+    let mut active_plane = chosen_plane;
+    if let Some((_, r)) = parse_plane(planes, chosen_plane, stride) {
+        if r != 0 {
+            chosen_res = r;
+        }
     }
+    if chosen_res == 0 && chosen_plane != 0 {
+        if let Some((_, r)) = parse_plane(planes, 0, stride) {
+            if r != 0 {
+                chosen_res = r;
+                active_plane = 0;
+            }
+        }
+    }
+
+    let (width, height, format) = resource_dims_and_format(chosen_res);
+
+    let config = PlaneConfigState {
+        plane_count,
+        stride,
+        active_plane,
+        width,
+        height,
+        format,
+    };
+    let config_changed = {
+        let mut last = LAST_PLANE_CONFIG.lock().unwrap();
+        if *last != Some(config) {
+            *last = Some(config);
+            true
+        } else {
+            false
+        }
+    };
+    if config_changed {
+        crate::xlog_info!(
+            "D3D12.X: PresentX plane configuration change: count={plane_count}, stride={stride}, active_plane={active_plane}, width={width}, height={height}, format={format}"
+        );
+        for i in 0..plane_count as usize {
+            let p = planes.add(i * stride);
+            if crate::gpu::shader::readable(p as usize, 0x18) {
+                let tok = (p as *const u64).read_unaligned();
+                let cnt = (p.add(8) as *const u32).read_unaligned();
+                let lst = (p.add(0x10) as *const usize).read_unaligned();
+                let r_i = if cnt > 0 && crate::gpu::shader::readable(lst, 8) {
+                    (lst as *const usize).read_unaligned()
+                } else {
+                    0
+                };
+                let (w_i, h_i, fmt_i) = resource_dims_and_format(r_i);
+                crate::xlog_info!(
+                    "D3D12.X: Plane {i}: token={tok:#x}, count={cnt}, resource={r_i:#x}, width={w_i}, height={h_i}, format={fmt_i}"
+                );
+            }
+        }
+        let n = (stride / 8) * plane_count as usize;
+        let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) {
+            (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect()
+        } else {
+            Vec::new()
+        };
+        crate::xlog_info!("D3D12.X: PresentX raw plane words: {words:x?}");
+    }
+
+    if chosen_res == 0 || !enabled() {
+        return tokens;
+    }
+    let res = chosen_res;
     {
         let mut p = PRESENTED.lock().unwrap();
         if !p.contains(&res) {
@@ -128,10 +265,11 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
                 v.sort_by_key(|(_, u)| std::cmp::Reverse(u[0] + u[1] + u[2]));
                 v.iter().take(6).map(|(k, u)| format!("{k:#x}: rt {} uav {} copy {} clear {}", u[0], u[1], u[2], u[3])).collect()
             };
-            crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
+            crate::xlog_info!("frame trace: PresentX #{n} plane {active_plane} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
     present_now(Duration::ZERO, Some((queue as usize, res)));
+    tokens
 }
 
 thread_local! {
@@ -243,6 +381,19 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
+    if res == 0 || (res & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(res, 8) {
+        return None;
+    }
+    let vtable = *(res as *const usize);
+    const GET_DESC_SLOT: usize = 10;
+    const VTABLE_MIN_READABLE: usize = (GET_DESC_SLOT + 1) * std::mem::size_of::<usize>();
+    if vtable == 0 || (vtable & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(vtable, VTABLE_MIN_READABLE) {
+        return None;
+    }
+    let get_desc = *((vtable as *const usize).add(GET_DESC_SLOT));
+    if get_desc == 0 || (get_desc & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(get_desc, 1) {
+        return None;
+    }
     let raw = res as *mut c_void;
     let r = ID3D12Resource::from_raw_borrowed(&raw)?;
     let d = r.GetDesc();
@@ -1103,6 +1254,127 @@ mod tests {
             std::env::set_var("XCL_WINDOW_POS", "center");
             assert_eq!(window_position("auto", 1280, 720), window_position("center", 1280, 720));
             std::env::remove_var("XCL_WINDOW_POS");
+        }
+    }
+
+    #[test]
+    fn backbuffer_like_guards_against_invalid_pointers_and_vtables() {
+        unsafe {
+            // Null pointer
+            assert!(backbuffer_like(0).is_none());
+            // Misaligned pointer
+            assert!(backbuffer_like(0x1001).is_none());
+            assert!(backbuffer_like(0x1003).is_none());
+            // Unmapped address
+            assert!(backbuffer_like(0xDEAD_BEEF_0000).is_none());
+
+            // Readable memory with null vtable
+            let dummy_vtable: usize = 0;
+            let dummy_obj: *const usize = &dummy_vtable;
+            assert!(backbuffer_like(dummy_obj as usize).is_none());
+
+            // Readable memory with misaligned vtable
+            let misaligned_vtable: usize = 0x7FFF_0001;
+            let dummy_obj_misaligned: *const usize = &misaligned_vtable;
+            assert!(backbuffer_like(dummy_obj_misaligned as usize).is_none());
+
+            // Readable memory with unmapped vtable
+            let unmapped_vtable: usize = 0xDEAD_CAFE_0000;
+            let dummy_obj_unmapped: *const usize = &unmapped_vtable;
+            assert!(backbuffer_like(dummy_obj_unmapped as usize).is_none());
+
+            // Readable vtable but truncated (less than 88 bytes, e.g. 64 bytes)
+            let truncated_vtable = [0usize; 8];
+            let vtable_ptr: usize = truncated_vtable.as_ptr() as usize;
+            let dummy_obj_truncated: *const usize = &vtable_ptr;
+            assert!(backbuffer_like(dummy_obj_truncated as usize).is_none());
+
+            // Readable vtable (>= 88 bytes) but null GetDesc function pointer at slot 10
+            let mut vtable_with_null_fn = [0usize; 15];
+            vtable_with_null_fn[10] = 0;
+            let vtable_ptr2: usize = vtable_with_null_fn.as_ptr() as usize;
+            let dummy_obj_null_fn: *const usize = &vtable_ptr2;
+            assert!(backbuffer_like(dummy_obj_null_fn as usize).is_none());
+
+            // Readable vtable with misaligned GetDesc function pointer
+            let mut vtable_with_misaligned_fn = [0usize; 15];
+            vtable_with_misaligned_fn[10] = 0x7FFF_0001;
+            let vtable_ptr3: usize = vtable_with_misaligned_fn.as_ptr() as usize;
+            let dummy_obj_misaligned_fn: *const usize = &vtable_ptr3;
+            assert!(backbuffer_like(dummy_obj_misaligned_fn as usize).is_none());
+        }
+    }
+
+    #[test]
+    fn opt_in_plane_selection_extracts_plane1_via_72_byte_stride() {
+        unsafe {
+            const RETAIL_PLANE_STRIDE: usize = 72;
+            let mut plane_data = vec![0u8; RETAIL_PLANE_STRIDE * 2];
+            let res0 = 0x1111_0000usize;
+            let res1 = 0x2222_0000usize;
+            let list0 = &res0 as *const usize as usize;
+            let list1 = &res1 as *const usize as usize;
+
+            // Plane 0: token = 0x10, count = 1, list = list0
+            *(plane_data.as_mut_ptr() as *mut u64) = 0x10;
+            *(plane_data.as_mut_ptr().add(8) as *mut u32) = 1;
+            *(plane_data.as_mut_ptr().add(0x10) as *mut usize) = list0;
+
+            // Plane 1: token = 0x20, count = 1, list = list1 at offset 72
+            *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE) as *mut u64) = 0x20;
+            *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE + 8) as *mut u32) = 1;
+            *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE + 0x10) as *mut usize) = list1;
+
+            // Default: plane 0 selected
+            std::env::remove_var("XCL_PRESENT_PLANE");
+            let (idx, stride) = selected_plane_index(2);
+            assert_eq!(idx, 0);
+            assert_eq!(stride, 72);
+            let parsed0 = parse_plane(plane_data.as_ptr(), idx, stride).unwrap();
+            assert_eq!(parsed0, (0x10, res0));
+
+            // Explicit XCL_PRESENT_PLANE=0: plane 0 selected
+            std::env::set_var("XCL_PRESENT_PLANE", "0");
+            let (idx0, stride0) = selected_plane_index(2);
+            assert_eq!(idx0, 0);
+            assert_eq!(stride0, 72);
+            let parsed0_exp = parse_plane(plane_data.as_ptr(), idx0, stride0).unwrap();
+            assert_eq!(parsed0_exp, (0x10, res0));
+
+            // Opt-in XCL_PRESENT_PLANE=1: plane 1 selected at stride 72
+            std::env::set_var("XCL_PRESENT_PLANE", "1");
+            let (idx1, stride1) = selected_plane_index(2);
+            assert_eq!(idx1, 1);
+            assert_eq!(stride1, 72);
+            let parsed1 = parse_plane(plane_data.as_ptr(), idx1, stride1).unwrap();
+            assert_eq!(parsed1, (0x20, res1));
+
+            // If plane_count is 1, XCL_PRESENT_PLANE=1 falls back to plane 0
+            let (idx_fallback, _) = selected_plane_index(1);
+            assert_eq!(idx_fallback, 0);
+
+            std::env::remove_var("XCL_PRESENT_PLANE");
+        }
+    }
+
+    #[test]
+    fn present_x_deduplicates_tokens_and_handles_retail_plane_stride() {
+        unsafe {
+            // Null or unreadable planes
+            assert_eq!(present_x(std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null()), 0);
+            assert_eq!(present_x(std::ptr::null_mut(), 2, std::ptr::null(), std::ptr::null()), 0);
+
+            const RETAIL_PLANE_STRIDE: usize = 72;
+            let mut plane_data = vec![0u8; RETAIL_PLANE_STRIDE * 2];
+            *(plane_data.as_mut_ptr() as *mut u64) = 0x100;
+            *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE) as *mut u64) = 0x100;
+
+            let tokens = present_x_frame(std::ptr::null_mut(), 2, plane_data.as_ptr());
+            assert_eq!(tokens, vec![0x100]);
+
+            *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE) as *mut u64) = 0x200;
+            let tokens2 = present_x_frame(std::ptr::null_mut(), 2, plane_data.as_ptr());
+            assert_eq!(tokens2, vec![0x100, 0x200]);
         }
     }
 }

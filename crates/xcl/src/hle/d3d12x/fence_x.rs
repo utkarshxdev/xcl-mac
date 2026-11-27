@@ -34,7 +34,7 @@ fn event() -> usize {
     *E.get_or_init(|| unsafe {
         let e = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize;
         let spawned = std::thread::Builder::new().name("xcl-fences".into()).spawn(move || loop {
-            th::WaitForSingleObject(e as _, th::INFINITE);
+            th::WaitForSingleObject(e as _, 10);
             refresh();
         });
         if let Err(err) = spawned {
@@ -61,9 +61,20 @@ fn refresh() {
     for (&p, f) in g.iter().flatten() {
         if let Some(c) = f.cell {
             if let Some(v) = unsafe { borrowed(p, |f| f.GetCompletedValue()) } {
-                let was = c.0.swap(v, Ordering::AcqRel);
-                if was != v && trace() {
-                    crate::xlog_info!("fence {p:#x}: completed value {was:#x} -> {v:#x} (cell {:p})", c.0.as_ptr());
+                let mut was = c.0.load(Ordering::Acquire);
+                while v > was {
+                    match c.0.compare_exchange_weak(was, v, Ordering::AcqRel, Ordering::Acquire) {
+                        Ok(_) => {
+                            unsafe {
+                                th::WakeByAddressAll(c.0.as_ptr() as *const c_void);
+                            }
+                            if trace() {
+                                crate::xlog_info!("fence {p:#x}: completed value {was:#x} -> {v:#x} (cell {:p})", c.0.as_ptr());
+                            }
+                            break;
+                        }
+                        Err(actual) => was = actual,
+                    }
                 }
             }
         }

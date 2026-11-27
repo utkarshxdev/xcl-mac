@@ -62,12 +62,13 @@ class WriteOp:
 
 
 class StoredTitleFence:
-    def __init__(self, addr: int, initial_val: u64 = 0):
+    def __init__(self, addr: int, initial_val: int = 0):
         self.addr = addr
         self.cell_val = initial_val
         self.signalled = initial_val
         self.waited = 0
         self.has_cell = True
+        self.wake_calls: int = 0
 
 
 class MockD3D12Fence:
@@ -91,8 +92,63 @@ class BottomOfPipeJob:
         self.timeout_rescued: bool = False
 
 
+# ==============================================================================
+# Model: RetailPlane & Display Plane Stride Selection
+# ==============================================================================
+RETAIL_PLANE_STRIDE: int = 72
+
+
+class RetailPlane:
+    def __init__(self, token: int, count: int, res_ptr: int, width: int = 3840, height: int = 2160, fmt: int = 28):
+        self.token = token
+        self.count = count
+        self.res_ptr = res_ptr
+        self.width = width
+        self.height = height
+        self.format = fmt
+
+
+class DisplayPlaneManager:
+    """Simulates present.rs plane stride parsing, opt-in selection, and config logging."""
+    def __init__(self):
+        self.plane_configs_logged: List[Dict[str, Any]] = []
+        self.last_config: Optional[Tuple[int, int, int, int, int, int]] = None
+
+    def select_plane(self, plane_count: int, env_override: Optional[int] = None) -> Tuple[int, int]:
+        """Returns (chosen_plane_index, stride)."""
+        stride = RETAIL_PLANE_STRIDE if plane_count >= 2 else 72
+        chosen = 1 if (env_override == 1 and plane_count >= 2) else 0
+        return chosen, stride
+
+    def parse_and_present(self, planes: List[RetailPlane], env_override: Optional[int] = None) -> Dict[str, Any]:
+        plane_count = len(planes)
+        chosen_idx, stride = self.select_plane(plane_count, env_override)
+        chosen_plane = planes[chosen_idx] if chosen_idx < plane_count else planes[0]
+
+        config = (plane_count, stride, chosen_idx, chosen_plane.width, chosen_plane.height, chosen_plane.format)
+        if config != self.last_config:
+            self.last_config = config
+            self.plane_configs_logged.append({
+                "count": plane_count,
+                "stride": stride,
+                "active_plane": chosen_idx,
+                "width": chosen_plane.width,
+                "height": chosen_plane.height,
+                "format": chosen_plane.format,
+            })
+        return {
+            "chosen_plane": chosen_idx,
+            "stride": stride,
+            "resource": chosen_plane.res_ptr,
+            "token": chosen_plane.token,
+            "width": chosen_plane.width,
+            "height": chosen_plane.height,
+            "format": chosen_plane.format,
+        }
+
+
 class CpuWritesAndFenceManager:
-    """Simulates cpu_writes.rs and fence_x.rs rescue mechanisms."""
+    """Simulates cpu_writes.rs and fence_x.rs non-forcing completion propagation."""
     def __init__(self, watchdog_timeout_ms: int = REDUCED_WATCHDOG_TIMEOUT_MS):
         self.watchdog_timeout_ms = watchdog_timeout_ms
         self.title_fences: Dict[int, StoredTitleFence] = {}
@@ -100,6 +156,7 @@ class CpuWritesAndFenceManager:
         self.simulated_memory: Dict[int, bytearray] = {}
         self.stall_warnings: List[str] = []
         self.rescued_fences_count: int = 0
+        self.wake_calls: List[int] = []
 
     def register_title_fence(self, addr: int, initial_val: int = 0) -> StoredTitleFence:
         tf = StoredTitleFence(addr, initial_val)
@@ -128,31 +185,45 @@ class CpuWritesAndFenceManager:
         offset = va & 0xFFF
         return bytes(self.simulated_memory[page][offset:offset + size])
 
-    def rescue_stalled_title_fences(self, queue_id: int) -> int:
-        rescued = 0
-        for tf in self.title_fences.values():
-            if tf.signalled > tf.cell_val:
-                tf.cell_val = tf.signalled
-                rescued += 1
-        self.rescued_fences_count += rescued
-        return rescued
+    def propagate_gpu_completion(self, fence_addr: int, gpu_completed_val: int) -> bool:
+        """Propagates real GPU completion monotonically and invokes WakeByAddressAll."""
+        if fence_addr in self.title_fences:
+            tf = self.title_fences[fence_addr]
+            if gpu_completed_val > tf.cell_val:
+                tf.cell_val = gpu_completed_val
+                tf.wake_calls += 1
+                self.wake_calls.append(fence_addr)
+                return True
+        return False
 
-    def poll_background_fences(self, elapsed_ms: int = BACKGROUND_POLL_INTERVAL_MS) -> int:
-        """Simulates 10ms background periodic polling in xcl-fences."""
+    def rescue_stalled_title_fences(self, queue_id: int) -> int:
+        """Deprecated artificial rescue stub retained for API compatibility; does not force fences."""
+        return 0
+
+    def poll_background_fences(self, elapsed_ms: Any = BACKGROUND_POLL_INTERVAL_MS, gpu_completed_values: Optional[Dict[int, int]] = None) -> int:
+        """Simulates 10ms background periodic polling in xcl-fences advancing monotonically on real GPU completion."""
         refreshed = 0
-        for tf in self.title_fences.values():
-            if tf.has_cell and tf.signalled > tf.cell_val:
-                tf.cell_val = tf.signalled
-                refreshed += 1
+        if isinstance(elapsed_ms, dict):
+            gpu_vals = elapsed_ms
+        else:
+            gpu_vals = gpu_completed_values or {addr: tf.signalled for addr, tf in self.title_fences.items()}
+        for addr, tf in self.title_fences.items():
+            if tf.has_cell:
+                completed = gpu_vals.get(addr, tf.cell_val)
+                # Monotonic advance: v > was
+                if completed > tf.cell_val:
+                    tf.cell_val = completed
+                    tf.wake_calls += 1
+                    self.wake_calls.append(addr)
+                    refreshed += 1
         return refreshed
 
     def process_bottom_of_pipe_jobs(self, elapsed_wait_ms: int) -> bool:
-        """Simulates worker thread execution in xcl-cpu-writes."""
+        """Simulates worker thread execution in xcl-cpu-writes without artificial fence rescue."""
         all_ok = True
         for job in self.jobs:
             if job.fence.get_completed_value() < job.target_value:
                 if elapsed_wait_ms >= self.watchdog_timeout_ms:
-                    # Timeout reached: active watchdog rescue!
                     job.timeout_rescued = True
                     self.stall_warnings.append(
                         f"D3D12.X: writes after the GPU so far done although their queue had not got there after {self.watchdog_timeout_ms} ms (fence at {job.fence.get_completed_value()}, wanted {job.target_value})"
@@ -164,9 +235,6 @@ class CpuWritesAndFenceManager:
 
                     # 2. Advance GPU fence from CPU
                     job.fence.signal_from_cpu(job.target_value)
-
-                    # 3. Rescue stalled title fences
-                    self.rescue_stalled_title_fences(job.queue_id)
                 else:
                     all_ok = False
             else:
@@ -477,45 +545,75 @@ class TestStage64Tier1Features(unittest.TestCase):
         mgr.process_bottom_of_pipe_jobs(elapsed_wait_ms=4000)
         self.assertEqual(fence.get_completed_value(), 3767)
 
-    def test_r1_title_fence_rescue_stalled_advancement(self):
-        """R1.4: Verify rescue_stalled_title_fences advances title fence 0x6000013dc310 (0x1d6c -> 0x1d6d)."""
-        mgr = CpuWritesAndFenceManager()
-        title_fence_addr = 0x6000013dc310
-        tf = mgr.register_title_fence(title_fence_addr, initial_val=0x1d6c)
-        mgr.note_queue_signal(title_fence_addr, val=0x1d6d)
+    def test_r1_display_plane_stride_alignment_and_opt_in_selection(self):
+        """R1.4: Verify 72-byte RetailPlane stride parsing and opt-in XCL_PRESENT_PLANE selection."""
+        plane_mgr = DisplayPlaneManager()
+        plane0 = RetailPlane(token=0x100, count=1, res_ptr=0x10080DE0, width=3840, height=2160, fmt=28)
+        plane1 = RetailPlane(token=0x100, count=1, res_ptr=0x10080DF8, width=2560, height=1440, fmt=28)
+        planes = [plane0, plane1]
 
-        # Before rescue: cell is at 0x1d6c
-        self.assertEqual(tf.cell_val, 0x1d6c)
+        # 1. Default (or XCL_PRESENT_PLANE unset/0): selects Plane 0 at stride 72
+        p0 = plane_mgr.parse_and_present(planes, env_override=0)
+        self.assertEqual(p0["chosen_plane"], 0)
+        self.assertEqual(p0["stride"], 72)
+        self.assertEqual(p0["resource"], 0x10080DE0)
+        self.assertEqual(p0["width"], 3840)
 
-        # Rescue stalled fences
-        rescued = mgr.rescue_stalled_title_fences(queue_id=0)
-        self.assertEqual(rescued, 1)
-        self.assertEqual(tf.cell_val, 0x1d6d)
+        # 2. Opt-in XCL_PRESENT_PLANE=1: selects Plane 1 at 72-byte stride offset
+        p1 = plane_mgr.parse_and_present(planes, env_override=1)
+        self.assertEqual(p1["chosen_plane"], 1)
+        self.assertEqual(p1["stride"], 72)
+        self.assertEqual(p1["resource"], 0x10080DF8)
+        self.assertEqual(p1["width"], 2560)
+        self.assertEqual(p1["height"], 1440)
+
+        # 3. Verify plane configuration change logged count, stride, width, height, format
+        self.assertEqual(len(plane_mgr.plane_configs_logged), 2)
+        cfg0 = plane_mgr.plane_configs_logged[0]
+        self.assertEqual(cfg0["count"], 2)
+        self.assertEqual(cfg0["stride"], 72)
+        self.assertEqual(cfg0["width"], 3840)
+        self.assertEqual(cfg0["height"], 2160)
+        self.assertEqual(cfg0["format"], 28)
+        cfg1 = plane_mgr.plane_configs_logged[1]
+        self.assertEqual(cfg1["active_plane"], 1)
+        self.assertEqual(cfg1["width"], 2560)
 
     def test_r1_periodic_10ms_background_fence_polling(self):
-        """R1.5: Verify 10ms periodic background polling updates title fence cell without event loss."""
+        """R1.5: Verify 10ms background polling monotonically propagates real GPU completion with WakeByAddressAll."""
         mgr = CpuWritesAndFenceManager()
         tf = mgr.register_title_fence(0x6000013dc310, initial_val=100)
         mgr.note_queue_signal(0x6000013dc310, val=101)
 
-        # 10ms background poll fires
-        refreshed = mgr.poll_background_fences(elapsed_ms=10)
+        # GPU completed to 101: 10ms background poll fires and wakes address
+        refreshed = mgr.poll_background_fences(gpu_completed_values={0x6000013dc310: 101}, elapsed_ms=10)
         self.assertEqual(refreshed, 1)
         self.assertEqual(tf.cell_val, 101)
+        self.assertEqual(tf.wake_calls, 1)
+
+        # Monotonicity guard: a stale or lower GPU completed value (e.g. 99) never regresses cell
+        refreshed_stale = mgr.poll_background_fences(gpu_completed_values={0x6000013dc310: 99}, elapsed_ms=10)
+        self.assertEqual(refreshed_stale, 0)
+        self.assertEqual(tf.cell_val, 101)
+        self.assertEqual(tf.wake_calls, 1)
 
     def test_r1_title_watchdog_crash_prevention(self):
-        """R1.6: Verify stall rescue resolves at 4.0s, well within 20s game watchdog deadline."""
+        """R1.6: Verify GPU completion cleanly propagates before 20s game watchdog deadline."""
         mgr = CpuWritesAndFenceManager(watchdog_timeout_ms=4000)
         fence = MockD3D12Fence(initial_val=3766)
         tf = mgr.register_title_fence(0x6000013dc310, initial_val=0x1d6c)
         mgr.note_queue_signal(0x6000013dc310, val=0x1d6d)
         mgr.queue_bottom_of_pipe_job(0, fence, 3767, [])
 
-        mgr.process_bottom_of_pipe_jobs(elapsed_wait_ms=4000)
-        # Verify resolution completed before 20.0s deadline
+        # Real GPU completes command list
+        fence.signal_from_cpu(3767)
+        mgr.process_bottom_of_pipe_jobs(elapsed_wait_ms=3000)
+        mgr.propagate_gpu_completion(0x6000013dc310, 0x1d6d)
+
         self.assertLess(mgr.watchdog_timeout_ms, GAME_WATCHDOG_DEADLINE_MS)
         self.assertEqual(fence.get_completed_value(), 3767)
         self.assertEqual(tf.cell_val, 0x1d6d)
+        self.assertEqual(tf.wake_calls, 1)
 
     # --------------------------------------------------------------------------
     # R2: Staging Memory & Texture Upload Throttling on D3DMetal
@@ -789,22 +887,27 @@ class TestStage64Tier2Boundaries(unittest.TestCase):
         mgr.put_back()
         self.assertEqual(mgr.staging_retained_bytes, MAC_MAX_RETAINED_STAGING_BYTES)
 
-    def test_t2_multiple_stalled_fences_simultaneous_rescue(self):
-        """T2.8: Verify simultaneous stalls across multiple title fences are all rescued in single pass."""
+    def test_t2_multiple_fences_monotonic_completion_and_wake(self):
+        """T2.8: Verify multiple fences advance monotonically upon real GPU completion with WakeByAddressAll."""
         mgr = CpuWritesAndFenceManager()
         tf1 = mgr.register_title_fence(0x60000100, initial_val=10)
         tf2 = mgr.register_title_fence(0x60000200, initial_val=20)
         tf3 = mgr.register_title_fence(0x60000300, initial_val=30)
 
-        mgr.note_queue_signal(0x60000100, 11)
-        mgr.note_queue_signal(0x60000200, 21)
-        mgr.note_queue_signal(0x60000300, 31)
-
-        rescued = mgr.rescue_stalled_title_fences(queue_id=0)
-        self.assertEqual(rescued, 3)
+        # Real GPU completion for all 3 fences
+        gpu_done = {0x60000100: 11, 0x60000200: 21, 0x60000300: 31}
+        refreshed = mgr.poll_background_fences(gpu_completed_values=gpu_done, elapsed_ms=10)
+        self.assertEqual(refreshed, 3)
         self.assertEqual(tf1.cell_val, 11)
         self.assertEqual(tf2.cell_val, 21)
         self.assertEqual(tf3.cell_val, 31)
+        self.assertEqual(len(mgr.wake_calls), 3)
+
+        # Stalled fence without GPU completion does NOT artificially advance
+        mgr.note_queue_signal(0x60000100, 15)  # Title signaled 15, but GPU still at 11
+        stalled_refreshed = mgr.poll_background_fences(gpu_completed_values={0x60000100: 11}, elapsed_ms=10)
+        self.assertEqual(stalled_refreshed, 0)
+        self.assertEqual(tf1.cell_val, 11)  # Real GPU completion is gate: remains at 11
 
 
 class TestStage64Tier3Interactions(unittest.TestCase):
