@@ -119,7 +119,7 @@ struct Repacker {
     pso: ID3D12PipelineState,
 }
 
-type SignatureKey = (usize, i32);
+type SignatureKey = (usize, Option<usize>, i32);
 type RepackerKey = (usize, bool);
 static REPACKERS: Mutex<Option<HashMap<RepackerKey, Arc<Repacker>>>> = Mutex::new(None);
 static PACKED_SIGNATURES: Mutex<Option<HashMap<SignatureKey, ID3D12CommandSignature>>> = Mutex::new(None);
@@ -182,10 +182,10 @@ unsafe fn compute_pso(dev: &ID3D12Device, root: &ID3D12RootSignature, dxil: &[u8
     pso
 }
 
-unsafe fn packed_signature(dev: &ID3D12Device, root: &ID3D12RootSignature, sig: &Signature) -> Result<ID3D12CommandSignature, String> {
+unsafe fn packed_signature(dev: &ID3D12Device, root: Option<&ID3D12RootSignature>, sig: &Signature) -> Result<ID3D12CommandSignature, String> {
     let mut g = PACKED_SIGNATURES.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
-    let key = (root.as_raw() as usize, sig.action.0);
+    let key = (dev.as_raw() as usize, root.map(|r| r.as_raw() as usize), sig.action.0);
     if let Some(signature) = map.get(&key) {
         return Ok(signature.clone());
     }
@@ -196,7 +196,12 @@ unsafe fn packed_signature(dev: &ID3D12Device, root: &ID3D12RootSignature, sig: 
         },
         D3D12_INDIRECT_ARGUMENT_DESC { Type: sig.action, ..Default::default() },
     ];
-    let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 8 + sig.action_bytes, NumArgumentDescs: 2, pArgumentDescs: params.as_ptr(), NodeMask: 0 };
+    let (params, stride) = if root.is_some() {
+        (&params[..], 8 + sig.action_bytes)
+    } else {
+        (&params[1..], sig.action_bytes)
+    };
+    let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: stride, NumArgumentDescs: params.len() as u32, pArgumentDescs: params.as_ptr(), NodeMask: 0 };
     let mut out = None;
     dev.CreateCommandSignature(&desc, root, &mut out).map_err(|e| format!("create the packed indirect signature: {e}"))?;
     let out: ID3D12CommandSignature = out.ok_or("no packed indirect signature")?;
@@ -259,16 +264,19 @@ unsafe fn transition(list: &ID3D12GraphicsCommandList, resource: &ID3D12Resource
 pub(super) struct Recorded {
     pub(super) signature: ID3D12CommandSignature,
     pub(super) arguments: ID3D12Resource,
+    bound_io: Option<u64>,
     patches: Vec<Patch>,
 }
 
-fn indirect_rest() -> bool {
-    std::env::var("VICTORY_INDIRECT_REST")
-        .or_else(|_| std::env::var("XCL_INDIRECT_REST"))
-        .is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false") && (v == "1" || v.eq_ignore_ascii_case("true")))
-}
-
 impl Recorded {
+    pub(super) unsafe fn bind_arguments(&self, list: &ID3D12GraphicsCommandList) -> u64 {
+        if let Some(io) = self.bound_io {
+            list.SetComputeRootUnorderedAccessView(0, io);
+            return 8; // The packed record starts with the unused 64-bit IO address.
+        }
+        0
+    }
+
     pub(super) unsafe fn finish_gpu(&self, list: &ID3D12GraphicsCommandList) {
         // A list can execute more than once. Leave the scratch resource in its creation state.
         transition(list, &self.arguments, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -276,12 +284,8 @@ impl Recorded {
 
     pub(super) fn retain_and_clear(self, allocator: usize, shadow: &mut [u8]) {
         retain_resource(allocator, self.arguments);
-        if indirect_rest() {
-            for p in self.patches {
-                if let Some(chunk) = shadow.get_mut(p.shadow..p.shadow + 4) {
-                    chunk.fill(0);
-                }
-            }
+        for p in self.patches {
+            shadow[p.shadow..p.shadow + 4].fill(0);
         }
     }
 }
@@ -328,7 +332,11 @@ impl Repack<'_> {
         list.GetDevice(&mut dev).map_err(|e| format!("get the indirect list device: {e}"))?;
         let dev = dev.ok_or("no indirect list device")?;
         let repack = repacker(&dev, upload)?;
-        let signature = packed_signature(&dev, root, sig)?;
+        // D3DMetal may reject command signatures that set a root UAV. For a
+        // single dispatch the first scratch record's IO address is known now.
+        // Bind it directly and leave the dispatch dimensions and count on the GPU.
+        let bound_io = (!self.gfx && self.max == 1).then_some(scratch_va);
+        let signature = packed_signature(&dev, bound_io.is_none().then_some(root), sig)?;
         let mut arguments = None;
         dev.CreateCommittedResource(
             &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
@@ -347,7 +355,7 @@ impl Repack<'_> {
             scratch_va as u32, (scratch_va >> 32) as u32, IO_BYTES,
         ];
         repack.dispatch(list, upload, input, scratch_va, &arguments, &config, groups);
-        Ok(Recorded { signature, arguments, patches })
+        Ok(Recorded { signature, arguments, bound_io, patches })
     }
 }
 
@@ -401,6 +409,15 @@ mod tests {
 
     #[test]
     fn gpu_repack_preserves_per_dispatch_values_and_the_count_buffer() {
+        gpu_repack(false);
+    }
+
+    #[test]
+    fn gpu_repack_single_dispatch_uses_plain_signature_and_honors_count() {
+        gpu_repack(true);
+    }
+
+    fn gpu_repack(single_dispatch: bool) {
         use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -431,14 +448,15 @@ mod tests {
                 out.unwrap()
             };
             let gpu_buffer = |size, state| buffer(size, D3D12_HEAP_TYPE_DEFAULT, state, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-            let (count, stride, record_bytes, max) = (2u32, 20u32, 20u32, 3u32);
+            let (count, max) = if single_dispatch { (1u32, 1u32) } else { (2, 3) };
+            let (stride, record_bytes) = (20u32, 20u32);
             let template_at = max * IO_BYTES;
             let scratch_bytes = template_at + IO_BYTES + 16;
             let src = gpu_buffer(u64::from(max * stride), D3D12_RESOURCE_STATE_COPY_DEST);
             let scratch = gpu_buffer(u64::from(scratch_bytes), D3D12_RESOURCE_STATE_COPY_DEST);
             let packed = gpu_buffer(u64::from(max * record_bytes), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             let results = gpu_buffer(16, D3D12_RESOURCE_STATE_COPY_DEST);
-            let readback = buffer(16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+            let readback = buffer(32, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
             let upload = buffer(u64::from(scratch_bytes) + 128, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
             let mut data = vec![0u32; (scratch_bytes as usize + 128) / 4];
             data[..15].copy_from_slice(&[0, 4, 1, 1, 1, 1, 9, 1, 1, 1, 2, 50, 1, 1, 1]);
@@ -456,7 +474,7 @@ mod tests {
 
             let prep = repacker(&dev, false).unwrap();
             let sig = Signature::parse(stride, &[[5, 0, 1, 2], [2, 0, 0, 0]]).unwrap();
-            let native_sig = packed_signature(&dev, &prep.root, &sig).unwrap();
+            let native_sig = packed_signature(&dev, (!single_dispatch).then_some(&prep.root), &sig).unwrap();
             let work = recomp::dxc::compile(
                 "RWByteAddressBuffer io : register(u0); RWByteAddressBuffer result : register(u1);
                  [numthreads(1,1,1)] void main() { result.Store(io.Load(20) * 4, io.Load(24) + io.Load(16)); }",
@@ -469,7 +487,26 @@ mod tests {
             list.SetPipelineState(&work);
             list.SetComputeRootSignature(&prep.root);
             list.SetComputeRootUnorderedAccessView(1, results.GetGPUVirtualAddress());
-            list.ExecuteIndirect(&native_sig, max, &packed, 0, &upload, 64);
+            let mut shadow = [0x5a; 16];
+            let recorded = Recorded {
+                signature: native_sig,
+                arguments: packed,
+                bound_io: single_dispatch.then_some(va),
+                patches: sig.patches(
+                    &Layout { params: vec![Param::Constants { at: 0, count: 4 }], size: 16, inline: 16, inline_gfx: 16, inline_ms: 16 },
+                    16,
+                    false,
+                ).unwrap(),
+            };
+            let offset = recorded.bind_arguments(&list);
+            if single_dispatch {
+                // The zero count suppresses execution even though the argument record is live.
+                list.ExecuteIndirect(&recorded.signature, max, &recorded.arguments, offset, &upload, 68);
+                transition(&list, &results, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list.CopyBufferRegion(&readback, 16, &results, 0, 16);
+                transition(&list, &results, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            list.ExecuteIndirect(&recorded.signature, max, &recorded.arguments, offset, &upload, 64);
             transition(&list, &results, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list.CopyBufferRegion(&readback, 0, &results, 0, 16);
             list.Close().unwrap();
@@ -488,8 +525,15 @@ mod tests {
             assert_eq!(waited, WAIT_OBJECT_0);
             readback.Map(0, None, Some(&mut mapped)).unwrap();
             let actual = mapped.cast::<[u32; 4]>().read();
+            if single_dispatch {
+                assert_eq!(mapped.cast::<[u32; 4]>().add(1).read(), [0; 4]);
+            }
             readback.Unmap(0, None);
-            assert_eq!(actual, [11, 16, 0, 0]);
+            assert_eq!(actual, if single_dispatch { [11, 0, 0, 0] } else { [11, 16, 0, 0] });
+            let allocator_key = allocator.as_raw() as usize;
+            recorded.retain_and_clear(allocator_key, &mut shadow);
+            assert_eq!(shadow, [0x5a, 0x5a, 0x5a, 0x5a, 0, 0, 0, 0, 0, 0, 0, 0, 0x5a, 0x5a, 0x5a, 0x5a]);
+            allocator_reset(allocator_key);
         }
     }
 }

@@ -764,14 +764,16 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     with(this, |s| s.arena.take(u, size, 16, &mut s.uma)).map(|p| p as usize)
                 })
             }).map(|packed| {
+                let offset = packed.bind_arguments(list);
                 fresh_indirect_arguments(this, || {
-                    pc(this, packed.signature.as_raw() as usize, max, packed.arguments.as_raw() as usize, 0, count_buf, count_off);
+                    pc(this, packed.signature.as_raw() as usize, max, packed.arguments.as_raw() as usize, offset, count_buf, count_off);
                 });
                 packed.finish_gpu(list);
                 with(this, |s| {
                     let shadow = if gfx { &mut s.args_gfx } else { &mut s.args };
                     packed.retain_and_clear(s.allocator, shadow);
                 });
+                if offset == 0 { "indirect repacked" } else { "indirect repacked single dispatch" }
             })
         }
         Some(None) => Err("unsupported root-changing command signature".into()),
@@ -779,11 +781,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             fresh_indirect_arguments(this, || {
                 pc(this, sig, max, args, args_pc_off, count_buf, count_off);
             });
+            "indirect direct arguments"
         }),
     };
     match result {
-        Ok(()) => {
-            super::list_x::note_stall_work(this, "indirect", pso, [args as u64, count_buf as u64, max.into()]);
+        Ok(kind) => {
+            super::list_x::note_stall_work(this, kind, pso, [args as u64, count_buf as u64, max.into()]);
             count(if gfx { DRAWS } else { DISPATCHES });
         }
         Err(e) => {
@@ -2020,7 +2023,8 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(checked_mesh_groups(u32::MAX, 2, 1, u32::MAX), None);
     }
 
-    /// Dedicated unit test validating that translated indirect calls wrap execution with argument barriers.
+    /// Exercise the barrier helper on real lists and confirm that lists without
+    /// usable recording state still execute the indirect call.
     #[test]
     fn translated_indirect_calls_wrap_execution_with_argument_barriers() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -2047,19 +2051,7 @@ void main(uint t : SV_GroupIndex) {
         assert!(executed, "fresh_indirect_arguments must execute op for bundle");
         list_x::on_release(bundle as usize);
 
-        // 3. Tracked compute list without device executes operation cleanly
-        let compute = 0x7300_0003usize as *mut c_void;
-        unsafe { list_x::on_create(compute, 0x1000, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE); }
-        executed = false;
-        unsafe {
-            fresh_indirect_arguments(compute, || {
-                executed = true;
-            });
-        }
-        assert!(executed, "fresh_indirect_arguments must execute op for compute list without device");
-        list_x::on_release(compute as usize);
-
-        // 4. For tracked direct/compute command list with GPU device, verify argument barrier wrapping
+        // A tracked list calls GetDevice through its COM vtable. Use a real list.
         unsafe {
             let mut dev: Option<ID3D12Device> = None;
             if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
@@ -2070,7 +2062,10 @@ void main(uint t : SV_GroupIndex) {
                     }
                 }
             }
-            let Some(dev) = dev else { return };
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return;
+            };
             let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
@@ -2094,8 +2089,9 @@ void main(uint t : SV_GroupIndex) {
             let order_buf2 = argument_order_buffer(&list);
             assert_eq!(order_buf2.unwrap().as_raw(), b.as_raw(), "cached order buffer must be reused");
 
-            list.Close().unwrap();
-            list_x::on_release(raw as usize);
+            let close: unsafe extern "system" fn(*mut c_void) -> windows::core::HRESULT =
+                std::mem::transmute(real::orig_fn(raw, 9));
+            close(raw).ok().unwrap();
         }
     }
 }
