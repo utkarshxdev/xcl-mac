@@ -52,6 +52,7 @@ pub const RETAIL_PLANE_STRIDE: usize = 72;
 struct PlaneConfigState {
     plane_count: u32,
     stride: usize,
+    requested_plane: usize,
     active_plane: usize,
     width: u32,
     height: u32,
@@ -60,14 +61,15 @@ struct PlaneConfigState {
 
 static LAST_PLANE_CONFIG: Mutex<Option<PlaneConfigState>> = Mutex::new(None);
 
-pub fn selected_plane_index(plane_count: u32) -> (usize, usize) {
-    let stride = if plane_count >= 2 { RETAIL_PLANE_STRIDE } else { 72 };
-    let req = std::env::var("XCL_PRESENT_PLANE")
+fn requested_plane_index() -> usize {
+    let request = std::env::var("XCL_PRESENT_PLANE")
         .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    let chosen = if req == 1 && plane_count >= 2 { 1 } else { 0 };
-    (chosen, stride)
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    usize::from(request == Some(1))
+}
+
+fn selected_plane_index(requested: usize, plane_count: u32) -> usize {
+    if plane_count >= 2 { requested } else { 0 }
 }
 
 pub unsafe fn parse_plane(planes: *const u8, plane_index: usize, stride: usize) -> Option<(u64, usize)> {
@@ -89,35 +91,45 @@ pub unsafe fn parse_plane(planes: *const u8, plane_index: usize, stride: usize) 
     Some((token, res))
 }
 
-unsafe fn get_resource_desc(res: usize) -> Option<D3D12_RESOURCE_DESC> {
-    if res == 0 || (res & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(res, 8) {
-        return None;
+unsafe fn check_resource_desc_slot(res: usize) -> Result<(), &'static str> {
+    use crate::gpu::shader::readable;
+
+    if res == 0 {
+        return Err("no resource");
+    }
+    if res % std::mem::align_of::<usize>() != 0 {
+        return Err("resource pointer is misaligned");
+    }
+    // D3DMetal may put the object on a native heap even when its original vtable is in a PE
+    // module. Use the same guarded read and XCL vtable check as the texture refresh path.
+    let readable_object = readable(res, 8)
+        || (crate::util::mac_host() && super::real::is_adopted_mac_texture(res as *mut c_void));
+    if !readable_object {
+        return Err("resource pointer is unreadable");
     }
     let vtable = *(res as *const usize);
     const GET_DESC_SLOT: usize = 10;
     const VTABLE_MIN_READABLE: usize = (GET_DESC_SLOT + 1) * std::mem::size_of::<usize>();
-    if vtable == 0 || (vtable & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(vtable, VTABLE_MIN_READABLE) {
-        return None;
+    if vtable % std::mem::align_of::<usize>() != 0 || !readable(vtable, VTABLE_MIN_READABLE) {
+        return Err("resource vtable is misaligned or unreadable");
     }
     let get_desc = *((vtable as *const usize).add(GET_DESC_SLOT));
-    if get_desc == 0 || (get_desc & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(get_desc, 1) {
-        return None;
+    // x64 code entry points need no pointer-size alignment.
+    if !readable(get_desc, 1) {
+        return Err("GetDesc entry is null or unreadable");
     }
+    Ok(())
+}
+
+unsafe fn get_resource_desc(res: usize) -> Result<D3D12_RESOURCE_DESC, &'static str> {
+    check_resource_desc_slot(res)?;
     let raw = res as *mut c_void;
-    let r = ID3D12Resource::from_raw_borrowed(&raw)?;
-    Some(r.GetDesc())
+    let r = ID3D12Resource::from_raw_borrowed(&raw).ok_or("no resource")?;
+    Ok(r.GetDesc())
 }
 
-unsafe fn resource_dims_and_format(res: usize) -> (u32, u32, i32) {
-    if let Some(d) = get_resource_desc(res) {
-        (d.Width as u32, d.Height, d.Format.0)
-    } else {
-        (0, 0, 0)
-    }
-}
-
-/// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
-/// the frame; S_OK always (a console present does not fail for the title).
+/// Command queue #30 PresentX(planeCount, planes, parameters). The selected plane's
+/// first resource is the frame. Always returns S_OK.
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
@@ -151,7 +163,9 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
 
-    let (chosen_plane, stride) = selected_plane_index(plane_count);
+    let requested_plane = requested_plane_index();
+    let chosen_plane = selected_plane_index(requested_plane, plane_count);
+    let stride = RETAIL_PLANE_STRIDE;
 
     let mut tokens = Vec::with_capacity(plane_count as usize);
     for i in 0..plane_count as usize {
@@ -186,11 +200,16 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         }
     }
 
-    let (width, height, format) = resource_dims_and_format(chosen_res);
+    let active_desc = get_resource_desc(chosen_res);
+    let (width, height, format) = active_desc
+        .as_ref()
+        .map(|d| (d.Width as u32, d.Height, d.Format.0))
+        .unwrap_or_default();
 
     let config = PlaneConfigState {
         plane_count,
         stride,
+        requested_plane,
         active_plane,
         width,
         height,
@@ -207,7 +226,8 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     };
     if config_changed {
         crate::xlog_info!(
-            "D3D12.X: PresentX plane configuration change: count={plane_count}, stride={stride}, active_plane={active_plane}, width={width}, height={height}, format={format}"
+            "D3D12.X: PresentX plane configuration change: count={plane_count}, stride={stride}, requested_plane={requested_plane}, active_plane={active_plane}, width={width}, height={height}, format={format}, presentation_enabled={}",
+            enabled()
         );
         for i in 0..plane_count as usize {
             let p = planes.add(i * stride);
@@ -220,13 +240,19 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
                 } else {
                     0
                 };
-                let (w_i, h_i, fmt_i) = resource_dims_and_format(r_i);
-                crate::xlog_info!(
-                    "D3D12.X: Plane {i}: token={tok:#x}, count={cnt}, resource={r_i:#x}, width={w_i}, height={h_i}, format={fmt_i}"
-                );
+                match get_resource_desc(r_i) {
+                    Ok(d) => crate::xlog_info!(
+                        "D3D12.X: Plane {i}: token={tok:#x}, count={cnt}, resource={r_i:#x}, {}x{}, dimension={}, layers={}, format={}, samples={}, presentable={}",
+                        d.Width, d.Height, d.Dimension.0, d.DepthOrArraySize, d.Format.0, d.SampleDesc.Count, is_backbuffer_desc(&d)
+                    ),
+                    Err(reason) => crate::xlog_info!(
+                        "D3D12.X: Plane {i}: token={tok:#x}, count={cnt}, resource={r_i:#x}, descriptor unavailable ({reason})"
+                    ),
+                }
             }
         }
-        let n = (stride / 8) * plane_count as usize;
+        // A single-plane caller only needs to supply the fields through the resource list.
+        let n = if plane_count == 1 { 3 } else { (stride / 8) * plane_count as usize };
         let words: Vec<u64> = (0..n)
             .take_while(|&k| crate::gpu::shader::readable((planes as usize) + 8 * k, 8))
             .map(|k| (planes as *const u64).add(k).read_unaligned())
@@ -234,7 +260,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         crate::xlog_info!("D3D12.X: PresentX raw plane words: {words:x?}");
     }
 
-    if chosen_res == 0 || !enabled() {
+    if active_desc.is_err() || !enabled() {
         return tokens;
     }
     let res = chosen_res;
@@ -382,14 +408,16 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
-    let d = get_resource_desc(res)?;
-    let ok = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+    get_resource_desc(res).ok().filter(is_backbuffer_desc)
+}
+
+fn is_backbuffer_desc(d: &D3D12_RESOURCE_DESC) -> bool {
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && d.Width >= 640
         && d.Height >= 360
         && d.DepthOrArraySize == 1
         && d.SampleDesc.Count == 1
-        && swap_format(d.Format).is_some();
-    ok.then_some(d)
+        && swap_format(d.Format).is_some()
 }
 
 /// queues the title submitted work to (AddRef'd: they stay valid for `drain`)
@@ -568,7 +596,13 @@ unsafe fn show_compiling(hwnd: HWND) {
 
 fn window_thread() {
     unsafe {
-        let Ok(inst) = GetModuleHandleW(PCWSTR::null()) else { return };
+        let inst = match GetModuleHandleW(PCWSTR::null()) {
+            Ok(inst) => inst,
+            Err(err) => {
+                crate::xlog_error!("present: GetModuleHandleW for XCL window: {err}");
+                return;
+            }
+        };
         let class = windows::core::w!("XCLGameWindow");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
@@ -598,9 +632,12 @@ fn window_thread() {
             Some(inst.into()),
             None,
         );
-        let Ok(hwnd) = hwnd else {
-            crate::xlog_error!("could not create the XCL window");
-            return;
+        let hwnd = match hwnd {
+            Ok(hwnd) => hwnd,
+            Err(err) => {
+                crate::xlog_error!("present: CreateWindowExW for XCL window: {err}");
+                return;
+            }
         };
         if crate::hle::kbm::background() {
             // shown behind the program in front, without becoming the active window
@@ -661,11 +698,15 @@ unsafe fn window_position(setting: &str, w: i32, h: i32) -> (i32, i32) {
 fn ensure_window() -> Option<HWND> {
     static START: Once = Once::new();
     START.call_once(|| {
-        let _ = std::thread::Builder::new().name("xcl-window".into()).spawn(window_thread);
+        if let Err(err) = std::thread::Builder::new().name("xcl-window".into()).spawn(window_thread) {
+            crate::xlog_error!("present: could not start the XCL window thread: {err}");
+        }
     });
     let t0 = Instant::now();
     while HWND_RAW.load(Ordering::Acquire) == 0 {
         if t0.elapsed() > Duration::from_secs(3) {
+            static LOG_TIMEOUT: Once = Once::new();
+            LOG_TIMEOUT.call_once(|| crate::xlog_warn!("present: XCL window was not ready after 3 seconds"));
             return None;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -722,15 +763,18 @@ unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after:
     }
 }
 
-unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
+unsafe fn new_presenter(queue: usize) -> Result<Presenter, String> {
     let dev_raw = super::real::device_raw();
-    let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
-    list.Close().ok()?;
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-    let event = CreateEventW(None, false, false, None).ok()?;
-    Some(Presenter {
+    let dev = ID3D12Device::from_raw_borrowed(&dev_raw).ok_or("D3D12 device is unavailable")?;
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+        .map_err(|err| format!("CreateCommandAllocator: {err}"))?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+        .map_err(|err| format!("CreateCommandList: {err}"))?;
+    list.Close().map_err(|err| format!("Close command list: {err}"))?;
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+        .map_err(|err| format!("CreateFence: {err}"))?;
+    let event = CreateEventW(None, false, false, None).map_err(|err| format!("CreateEventW: {err}"))?;
+    Ok(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
         copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
@@ -820,7 +864,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         *guard = None;
     }
     if guard.is_none() {
-        *guard = new_presenter(queue);
+        match new_presenter(queue) {
+            Ok(presenter) => *guard = Some(presenter),
+            Err(err) => {
+                static LOG_SETUP_ERROR: Once = Once::new();
+                LOG_SETUP_ERROR.call_once(|| crate::xlog_error!("present: could not initialize presenter: {err}"));
+                return;
+            }
+        }
     }
     let Some(p) = guard.as_mut() else { return };
     if p.disabled || p.last.elapsed() < min_interval {
@@ -1281,14 +1332,17 @@ mod tests {
             let vtable_ptr2: usize = vtable_with_null_fn.as_ptr() as usize;
             let dummy_obj_null_fn: *const usize = &vtable_ptr2;
             assert!(backbuffer_like(dummy_obj_null_fn as usize).is_none());
-
-            // Readable vtable with misaligned GetDesc function pointer
-            let mut vtable_with_misaligned_fn = [0usize; 15];
-            vtable_with_misaligned_fn[10] = 0x7FFF_0001;
-            let vtable_ptr3: usize = vtable_with_misaligned_fn.as_ptr() as usize;
-            let dummy_obj_misaligned_fn: *const usize = &vtable_ptr3;
-            assert!(backbuffer_like(dummy_obj_misaligned_fn as usize).is_none());
         }
+    }
+
+    #[test]
+    fn resource_desc_slot_accepts_unaligned_code_address() {
+        // Exercise the slot check without calling through the test address.
+        let code = [0usize; 2];
+        let mut vtable = [0usize; 11];
+        vtable[10] = code.as_ptr() as usize + 1;
+        let object = vtable.as_ptr() as usize;
+        assert_eq!(unsafe { check_resource_desc_slot(&object as *const usize as usize) }, Ok(()));
     }
 
     #[test]
@@ -1311,33 +1365,14 @@ mod tests {
             *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE + 8) as *mut u32) = 1;
             *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE + 0x10) as *mut usize) = list1;
 
-            // Default: plane 0 selected
-            std::env::remove_var("XCL_PRESENT_PLANE");
-            let (idx, stride) = selected_plane_index(2);
-            assert_eq!(idx, 0);
-            assert_eq!(stride, 72);
-            let parsed0 = parse_plane(plane_data.as_ptr(), idx, stride).unwrap();
-            assert_eq!(parsed0, (0x10, res0));
-
-            // Explicit XCL_PRESENT_PLANE=0: plane 0 selected
-            std::env::set_var("XCL_PRESENT_PLANE", "0");
-            let (idx0, stride0) = selected_plane_index(2);
+            let idx0 = selected_plane_index(0, 2);
             assert_eq!(idx0, 0);
-            assert_eq!(stride0, 72);
-            let parsed0_exp = parse_plane(plane_data.as_ptr(), idx0, stride0).unwrap();
-            assert_eq!(parsed0_exp, (0x10, res0));
+            assert_eq!(parse_plane(plane_data.as_ptr(), idx0, RETAIL_PLANE_STRIDE), Some((0x10, res0)));
 
-            // Opt-in XCL_PRESENT_PLANE=1: plane 1 selected at stride 72
-            std::env::set_var("XCL_PRESENT_PLANE", "1");
-            let (idx1, stride1) = selected_plane_index(2);
+            let idx1 = selected_plane_index(1, 2);
             assert_eq!(idx1, 1);
-            assert_eq!(stride1, 72);
-            let parsed1 = parse_plane(plane_data.as_ptr(), idx1, stride1).unwrap();
-            assert_eq!(parsed1, (0x20, res1));
-
-            // If plane_count is 1, XCL_PRESENT_PLANE=1 falls back to plane 0
-            let (idx_fallback, _) = selected_plane_index(1);
-            assert_eq!(idx_fallback, 0);
+            assert_eq!(parse_plane(plane_data.as_ptr(), idx1, RETAIL_PLANE_STRIDE), Some((0x20, res1)));
+            assert_eq!(selected_plane_index(1, 1), 0);
 
             // Plane 1 with count = 0 returns (token, 0)
             *(plane_data.as_mut_ptr().add(RETAIL_PLANE_STRIDE + 8) as *mut u32) = 0;
@@ -1351,8 +1386,6 @@ mod tests {
                 chosen = parsed0_fallback.1;
             }
             assert_eq!(chosen, res0);
-
-            std::env::remove_var("XCL_PRESENT_PLANE");
         }
     }
 
