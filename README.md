@@ -1,10 +1,29 @@
 # XCL Mac Native — Apple Silicon & macOS Compatibility Layer for Xbox Series X|S
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white)](https://discord.gg/dYuNEsQMQ)
+[![Latest Release](https://img.shields.io/badge/Release-Run%2015%20(Window%20%26%20Planes)-blue?logo=github)](https://github.com/utkarshxdev/xcl-mac/releases/tag/v0.1.0-stage6.4-run15-planes)
 [![Mac cross-build](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml/badge.svg?branch=main)](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml?query=branch%3Amain)
-[![Stage 6: Ingame 3D Rendering](https://img.shields.io/badge/Status-Stage%206%20(Ingame%203D)-success?logo=apple&color=34D399)](https://github.com/utkarshxdev/xcl-mac)
+[![Stage 6: Ingame 3D Rendering](https://img.shields.io/badge/Status-Stage%206%20(In--Game%20Presentation)-success?logo=apple&color=34D399)](https://github.com/utkarshxdev/xcl-mac)
 [![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS%20%7C%20Apple%20Silicon-black?logo=apple)](https://github.com/utkarshxdev/xcl-mac)
+
+<p align="center">
+  <img src="docs/media/gtavi_setup_preview.gif" alt="Grand Theft Auto VI running on Apple Silicon via XCL Mac Native" width="720">
+</p>
+<p align="center">
+  <b>Grand Theft Auto VI</b> running natively on Apple Silicon via <b>XCL Mac Native</b> under CrossOver & Apple D3DMetal (30.0 FPS locked presentation & setup sequence).
+</p>
+
+<p align="center">
+  <img src="docs/media/gtavi_splash_mural.jpg" width="32%" alt="GTA VI Splash Mural in XCL Window">
+  <img src="docs/media/gtavi_finish_setup.jpg" width="32%" alt="GTA VI Finish Setup UI at 30 FPS">
+  <img src="docs/media/gtavi_legal_policies.jpg" width="32%" alt="GTA VI Legal Terms & Policies Screen">
+</p>
+<p align="center">
+  🎬 <b><a href="docs/media/gtavi_on_mac_demo.mp4">Watch Full 70-Second High-Resolution Gameplay Capture (MP4)</a></b>
+</p>
+
+---
 
 **XCL Mac Native** (`utkarshxdev/xcl-mac`) is the dedicated, production-ready macOS and Apple Silicon distribution of [XCL](https://github.com/ivall/xcl) — the Xbox Series X|S (GDK) compatibility layer. 
 
@@ -97,7 +116,10 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 5. **D3D12 Agility SDK:** Place `D3D12Core.dll` into a `D3D12\` folder next to `xcl.exe` or configure `XCL_D3D12_DIR`.
 
 ### Pre-Built Binaries
-Download the latest `xcl-mac-wine-x86_64` build directly from the **[GitHub Actions Releases](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml)**.
+- **Latest Tested Release (Run 15 — Window & Dual-Plane Presentation):**  
+  👉 **[Download `xcl-run15-window-checked.zip`](https://github.com/utkarshxdev/xcl-mac/releases/download/v0.1.0-stage6.4-run15-planes/xcl-run15-window-checked.zip)** *(SHA-256: `aa5f7b13fe423af09fc7e0c33ef6cfd6501932057087ede733918251fca0710b`)*
+- View all releases and changelogs on the **[GitHub Releases Page](https://github.com/utkarshxdev/xcl-mac/releases)**.
+- Automated CI builds are available on the **[GitHub Actions Workflows](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml)**.
 
 ### Launch Command
 Launch your title through your Wine environment with the recommended Mac environment flags:
@@ -157,7 +179,7 @@ cargo build --release --locked --target x86_64-pc-windows-gnullvm -p xcl
 
 ## 🧪 Subsystem Verification
 
-We provide an automated verification suite that audits all 22 Mac-native architectural subsystems:
+We provide an automated verification suite that audits all 39 Mac-native architectural subsystems:
 
 ```bash
 ./scripts/verify_mac_build.sh
@@ -173,24 +195,41 @@ Checking: Stand-in PS dual-source blending (SV_Target0 + SV_Target1)   [PASS]
 Checking: D3DMetal shader refusal host fallback (refused_on_mac_host)  [PASS]
 Checking: Compute blob cache charging fix (insert_compute_blob)        [PASS]
 Checking: Rosetta missing AMD instruction handlers (CLZERO, INSERTQ)   [PASS]
-Checking: Rosetta AVX masked store decoder module (maskmov.rs)         [PASS]
-Checking: Rosetta masked store fault helper patching                   [PASS]
+Checking: Rosetta AVX masked store decoder module (crates/xcl/src/maskmov.rs) [PASS]
+Checking: Rosetta masked store fault helper patching (replace_masked_stores) [PASS]
 Checking: Rosetta CPU detection (util::rosetta)                        [PASS]
-Checking: UMA Shadowed fallback implementation                         [PASS]
+Checking: UMA Shadowed fallback implementation (OpenExistingHeapFromAddress) [PASS]
 Checking: UMA note_copy_into for readback buffers                      [PASS]
-Checking: GPU-visible fallback write-watch disable                     [PASS]
+Checking: GPU-visible fallback write-watch disable (XCL_WATCHED_FALLBACK) [PASS]
 Checking: Command queue #31 GPU view page mappings (gpu_views)         [PASS]
 Checking: Unwatched title textures content comparison (poll_unwatched) [PASS]
-Checking: Unchanged title texture upload skip override                 [PASS]
+Checking: Unchanged title texture upload skip override (XCL_TEXTURE_SKIP_UNCHANGED) [PASS]
 Checking: CopyMemoryToMemoryX CPU fallback for non-UMA ranges          [PASS]
-Checking: D3DMetal depth-only format mapping                           [PASS]
+Checking: D3DMetal depth-only format mapping (pc_depth_view_format)    [PASS]
 Checking: Mac host utility detection (util::mac_host)                  [PASS]
 Checking: Wine isolated thread heap for DXC (own_heaps)                [PASS]
 Checking: Network isolation default off (netoff)                       [PASS]
 Checking: 16 MiB title stacks under Wine                               [PASS]
+Checking: Sparse buffer lock safety (try_lock in forget_buffer)        [PASS]
+Checking: World-load watchdog & fatal crash bypass at 0x23cf683        [PASS]
+Checking: DirectStorage BCPack acceptance (XCL_DSTORAGE_BCPACK_ACCEPT) [PASS]
+Checking: Mesh root-argument layout (user_data_ms, inline_ms)          [PASS]
+Checking: Mesh companion DISPATCH signature creation                   [PASS]
+Checking: Real D3D12 DispatchMesh hooking (slot 127 / newer 129)       [PASS]
+Checking: GPU-side root-changing ExecuteIndirect repack                [PASS]
+Checking: Two-pass DispatchMesh & ExecuteIndirect execution harness    [PASS]
 Checking: Mac cross-build CI workflow (.github/workflows/mac-cross.yml) [PASS]
+Checking: CreateShaderCacheSession translation layer fallback          [PASS]
+Checking: Pointer alignment guard in is_adopted (align_of::<usize>)    [PASS]
+Checking: Heap mirroring and bounded root SRVs                         [PASS]
+Checking: Lock-free atomic pipeline building accounting (pso_async::counts) [PASS]
+Checking: XUserCompare 64-bit pointer overflow prevention              [PASS]
+Checking: XAsyncGetResult zero-used out parameter preservation         [PASS]
+Checking: GetModuleFileName ERROR_INSUFFICIENT_BUFFER on size 0        [PASS]
+Checking: Vertex buffer slot unbind & purge on null/zero views         [PASS]
+Checking: QueryInterface wrapper interface vtable release dispatch     [PASS]
 ======================================================================
-Verification Summary: 22 Passed, 0 Failed
+Verification Summary: 39 Passed, 0 Failed
 ======================================================================
 Status: Verification SUCCESSFUL! All Mac host subsystems present.
 ```
