@@ -116,8 +116,10 @@ All Mac-specific subsystems are strictly gated behind `crate::util::mac_host()` 
 5. **D3D12 Agility SDK:** Place `D3D12Core.dll` into a `D3D12\` folder next to `xcl.exe` or configure `XCL_D3D12_DIR`.
 
 ### Pre-Built Binaries
-- **Latest Tested Release (Run 15 — Window & Dual-Plane Presentation):**  
-  👉 **[Download `xcl-run15-window-checked.zip`](https://github.com/utkarshxdev/xcl-mac/releases/download/v0.1.0-stage6.4-run15-planes/xcl-run15-window-checked.zip)** *(SHA-256: `aa5f7b13fe423af09fc7e0c33ef6cfd6501932057087ede733918251fca0710b`)*
+- **Latest Verified Release (Stage 6.4 — Menu & Intro, Pre-Series S):**  
+  👉 **[Download `xcl-mac-stage6.4-menu.zip`](https://github.com/utkarshxdev/xcl-mac/releases/download/v0.1.0-stage6.4-menu/xcl-mac-stage6.4-menu.zip)** *(includes `xcl.exe`, `dxcompiler.dll`, `dxil.dll` — SHA-256: `d0cf51561411a8ebb83c66b043174ebc56226dc6df5ddae33463720a24263f23`)*
+- **Experimental Series S / Multi-Plane Pre-release (Run 15):**  
+  👉 **[Download `xcl-run15-window-checked.zip`](https://github.com/utkarshxdev/xcl-mac/releases/download/v0.1.0-stage6.4-run15-planes/xcl-run15-window-checked.zip)** *(includes `xcl.exe`, `dxcompiler.dll`, `dxil.dll` — SHA-256: `4ed9133051d74df5e30bc1be9c81d80773e5122711eaf743c72430dc32fc6d97`)*
 - View all releases and changelogs on the **[GitHub Releases Page](https://github.com/utkarshxdev/xcl-mac/releases)**.
 - Automated CI builds are available on the **[GitHub Actions Workflows](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml)**.
 
