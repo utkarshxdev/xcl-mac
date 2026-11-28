@@ -211,9 +211,55 @@ struct Uploader {
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     value: u64,
+    event: fence::Event,
     /// (buffer, its mapped bytes, capacity)
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    submitted: Option<SubmittedUpload>,
 }
+
+pub(crate) struct UploadTrace {
+    pub caller: usize,
+    pub pending_mappings: fn() -> String,
+}
+
+#[derive(Debug)]
+pub(crate) enum UploadError {
+    Prepare(String),
+    InFlight(String),
+}
+
+impl From<String> for UploadError {
+    fn from(error: String) -> Self {
+        Self::Prepare(error)
+    }
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepare(error) | Self::InFlight(error) => f.write_str(error),
+        }
+    }
+}
+
+struct SubmittedUpload {
+    destinations: Vec<ID3D12Resource>,
+    bytes: u64,
+    signalled: bool,
+    trace: Option<UploadTrace>,
+}
+
+impl SubmittedUpload {
+    fn signal<E>(&mut self, enqueue: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
+        if !self.signalled {
+            enqueue()?;
+            self.signalled = true;
+        }
+        Ok(())
+    }
+}
+
+const UPLOAD_TIMEOUT_MS: u32 = 10_000;
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
 unsafe impl Send for Uploader {}
@@ -241,7 +287,48 @@ impl Uploader {
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
+        let event = fence::Event::new().map_err(err)?;
+        Ok(Uploader { alloc, list, fence, value: 0, event, staging: None, submitted: None })
+    }
+
+    /// Keep every resource referenced by the list until its own fence really completes.
+    /// A failed Signal can be retried at the same value without resubmitting the copy.
+    unsafe fn finish_submitted(&mut self, dev: &ID3D12Device, queue: &ID3D12CommandQueue, timeout_ms: u32) -> Result<(), String> {
+        let Some(batch) = self.submitted.as_mut() else { return Ok(()) };
+        let key = windows::core::Interface::as_raw(queue) as usize;
+        let target = self.value;
+        if let Err(err) = batch.signal(|| queue.Signal(&self.fence, target)) {
+            let err = fence::api_error(dev, "Signal", err);
+            return Err(format!("texture copy: upload queue {key:#x} fence {target:#x} signal failed: {err}"));
+        }
+        let started = std::time::Instant::now();
+        let trace = batch.trace.take();
+        let count = batch.destinations.len();
+        let bytes = batch.bytes;
+        let mut reported = false;
+        let mut slow = |done, event_timeout| {
+            if let Some(t) = &trace {
+                let device = dev.GetDeviceRemovedReason().err();
+                crate::xlog_warn!(
+                    "texture upload slow: upload queue {key:#x}, calling queue {:#x}, {count} textures, {bytes} staging bytes, fence target {target:#x}, completed {done:#x}, event_timeout={event_timeout}, device={device:?}; pending queue waits: {}",
+                    t.caller, (t.pending_mappings)()
+                );
+                reported = true;
+            }
+        };
+        let observe = trace.is_some().then_some(&mut slow as &mut dyn FnMut(u64, bool));
+        let result = fence::wait_observed(&self.fence, target, dev, Some(self.event.0), timeout_ms, observe);
+        if let Some(t) = trace.filter(|_| reported || result.is_err()) {
+            let done = fence::completed_value(&self.fence, dev);
+            let device = dev.GetDeviceRemovedReason().err();
+            crate::xlog_info!(
+                "texture upload wait ended: upload queue {key:#x}, calling queue {:#x}, {count} textures, {bytes} staging bytes, fence target {target:#x}, completed {done:x?}, device={device:?}, elapsed {} ms, result={result:?}; pending queue waits: {}",
+                t.caller, started.elapsed().as_millis(), (t.pending_mappings)()
+            );
+        }
+        result.map_err(|e| format!("texture copy: upload queue {key:#x} fence {target:#x}: {e}"))?;
+        self.submitted = None;
+        Ok(())
     }
 
     /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
@@ -267,7 +354,19 @@ impl Uploader {
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
 /// order). A failure of one is returned with its index; the others still run. The texels go
 /// through the queue's kept upload buffer (`Uploader`).
-pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+pub unsafe fn upload_batch(
+    dev: &ID3D12Device, queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+) -> Result<Vec<(usize, String)>, String> {
+    upload_batch_traced(dev, queue, items, None).map_err(|err| err.to_string())
+}
+
+/// Callers serialize use of each upload queue, including retries of pending batches.
+pub(crate) unsafe fn upload_batch_traced(
+    dev: &ID3D12Device, queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+    trace: Option<UploadTrace>,
+) -> Result<Vec<(usize, String)>, UploadError> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -277,6 +376,10 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         Some(u) => u,
         None => Uploader::new(dev)?,
     };
+    if let Err(err) = up.finish_submitted(dev, queue, UPLOAD_TIMEOUT_MS) {
+        put_back(key, up);
+        return Err(UploadError::InFlight(err));
+    }
     // where each texture's texels go in the upload buffer
     let mut failed = Vec::new();
     let mut planned = Vec::with_capacity(items.len());
@@ -303,18 +406,18 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
     }
     up.list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
+    let list = windows::core::Interface::cast(&up.list).map_err(err)?;
+    up.submitted = Some(SubmittedUpload {
+        destinations: planned.iter().map(|&(index, _, _)| items[index].0.clone()).collect(),
+        bytes: total,
+        signalled: false,
+        trace,
+    });
     up.value += 1;
-    let copy_error = |e| format!("texture copy: {e}");
-    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
-        // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
-        // uploader next time) – freeing them under the GPU removed the device
-        std::mem::forget(up);
-        return Err(copy_error(e));
-    }
+    queue.ExecuteCommandLists(&[Some(list)]);
+    let result = up.finish_submitted(dev, queue, UPLOAD_TIMEOUT_MS);
     put_back(key, up);
-    Ok(failed)
+    result.map(|()| failed).map_err(UploadError::InFlight)
 }
 
 fn put_back(key: usize, up: Uploader) {
@@ -748,6 +851,47 @@ mod tests {
                     assert!(g == w, "format {} {:?} mode {} subresource {k} ({} × {} rows × {} B) differs", t.format, t.ty, t.swizzle_mode, w.depth, w.rows, w.row_bytes);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn failed_upload_signal_can_retry_without_submitting_another_copy() {
+        let mut batch = SubmittedUpload { destinations: Vec::new(), bytes: 0, signalled: false, trace: None };
+        assert_eq!(batch.signal(|| Err("signal failed")), Err("signal failed"));
+        assert!(!batch.signalled);
+        assert_eq!(batch.signal(|| Ok::<_, &str>(())), Ok(()));
+        assert!(batch.signalled);
+        assert_eq!(batch.signal::<&str>(|| panic!("an accepted signal cannot be queued again")), Ok(()));
+    }
+
+    #[test]
+    fn gpu_pending_upload_keeps_its_resources_until_fence_completion() {
+        let Some((dev, queue)) = device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        unsafe {
+            let mut up = Uploader::new(&dev).unwrap();
+            let (staging, _) = up.staging(&dev, 256).unwrap();
+            let destination = buffer(&dev, 256).unwrap();
+            let address = windows::core::Interface::as_raw(&destination);
+            up.value = 1;
+            // Model an accepted signal which the GPU has not reached. Nothing needs to hang
+            // on a real GPU to exercise the timeout and the exact retained uploader.
+            up.submitted = Some(SubmittedUpload {
+                destinations: vec![destination],
+                bytes: 256,
+                signalled: true,
+                trace: Some(UploadTrace { caller: 0x1234, pending_mappings: || "synthetic mapping wait".into() }),
+            });
+            assert!(up.finish_submitted(&dev, &queue, 1_050).unwrap_err().contains("still pending"));
+            let batch = up.submitted.as_ref().expect("timeout keeps the in-flight upload");
+            assert_eq!(windows::core::Interface::as_raw(&batch.destinations[0]), address);
+            assert_eq!(batch.destinations[0].GetDesc().Width, 256);
+            assert_eq!(up.staging.as_ref().unwrap().0, staging);
+            up.fence.Signal(1).unwrap();
+            up.finish_submitted(&dev, &queue, 0).unwrap();
+            assert!(up.submitted.is_none());
         }
     }
 

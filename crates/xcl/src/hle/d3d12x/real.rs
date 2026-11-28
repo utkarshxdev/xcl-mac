@@ -5827,7 +5827,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         return;
     }
     // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
+    if let Err(err) = super::title_textures::refresh(this) {
+        super::title_textures::stop_blocked_submission(this, &err);
+    }
     if crate::util::mac_host() {
         super::console_heap::resync_title_writes();
     }

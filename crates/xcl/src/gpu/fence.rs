@@ -42,7 +42,13 @@ pub(crate) unsafe fn completed_value(fence: &ID3D12Fence, dev: &ID3D12Device) ->
     Ok(value)
 }
 
-struct Event(HANDLE);
+pub(crate) struct Event(pub(crate) HANDLE);
+
+impl Event {
+    pub(crate) unsafe fn new() -> windows::core::Result<Self> {
+        CreateEventW(None, false, false, None).map(Self)
+    }
+}
 
 impl Drop for Event {
     fn drop(&mut self) {
@@ -56,6 +62,16 @@ impl Drop for Event {
 pub(crate) unsafe fn wait(
     fence: &ID3D12Fence, target: u64, dev: &ID3D12Device, event: Option<HANDLE>, timeout_ms: u32,
 ) -> Result<(), FenceError> {
+    wait_observed(fence, target, dev, event, timeout_ms, None)
+}
+
+/// For diagnostics, sample an outstanding wait at one second without changing its deadline
+/// or arming a second event. A completed sample on a slice timeout is logged before returning.
+pub(crate) unsafe fn wait_observed(
+    fence: &ID3D12Fence, target: u64, dev: &ID3D12Device, event: Option<HANDLE>, timeout_ms: u32,
+    mut slow: Option<&mut dyn FnMut(u64, bool)>,
+) -> Result<(), FenceError> {
+    const SLOW_MS: u32 = 1_000;
     if completed_value(fence, dev)? >= target {
         return Ok(());
     }
@@ -63,7 +79,7 @@ pub(crate) unsafe fn wait(
     let event = match event {
         Some(event) => event,
         None => {
-            owned = Event(CreateEventW(None, false, false, None).map_err(|e| api_error(dev, "CreateEventW", e))?);
+            owned = Event::new().map_err(|e| api_error(dev, "CreateEventW", e))?;
             owned.0
         }
     };
@@ -74,7 +90,12 @@ pub(crate) unsafe fn wait(
     let start = Instant::now();
     let mut remaining = timeout_ms;
     loop {
-        let status = WaitForSingleObject(event, remaining);
+        let slice = if slow.is_some() {
+            remaining.min(SLOW_MS.saturating_sub(start.elapsed().as_millis().min(u128::from(SLOW_MS)) as u32))
+        } else {
+            remaining
+        };
+        let status = WaitForSingleObject(event, slice);
         let error = (status == WAIT_FAILED).then(Error::from_thread);
         let completed = completed_value(fence, dev)?;
         if let Some(e) = error {
@@ -83,11 +104,16 @@ pub(crate) unsafe fn wait(
         if status != WAIT_OBJECT_0 && status != WAIT_TIMEOUT {
             return Err(FenceError::UnexpectedWait(status.0));
         }
+        let elapsed = start.elapsed().as_millis();
+        if timeout_ms > SLOW_MS && (elapsed >= u128::from(SLOW_MS) || (status == WAIT_TIMEOUT && slice < remaining)) {
+            if let Some(report) = slow.take() {
+                report(completed, status == WAIT_TIMEOUT);
+            }
+        }
         if completed >= target {
             return Ok(());
         }
-        let elapsed = start.elapsed().as_millis();
-        if status == WAIT_TIMEOUT || elapsed >= u128::from(timeout_ms) {
+        if (status == WAIT_TIMEOUT && slice == remaining) || elapsed >= u128::from(timeout_ms) {
             return Err(dev.GetDeviceRemovedReason().err().map_or(FenceError::Timeout(timeout_ms), FenceError::Removed));
         }
         remaining = timeout_ms - elapsed as u32;
@@ -148,7 +174,13 @@ mod tests {
     fn mock_wait(
         initial: u64, target: u64, on_arm: Option<(u64, bool)>, arm_result: HRESULT, removal_reason: HRESULT,
     ) -> (Result<(), FenceError>, u32) {
-        // Back the full vtables and implement the three methods used by wait.
+        mock_wait_observed(initial, target, on_arm, arm_result, removal_reason, (0, None))
+    }
+
+    fn mock_wait_observed(
+        initial: u64, target: u64, on_arm: Option<(u64, bool)>, arm_result: HRESULT, removal_reason: HRESULT,
+        (timeout, slow): (u32, Option<&mut dyn FnMut(u64, bool)>),
+    ) -> (Result<(), FenceError>, u32) {
         const SLOT: usize = size_of::<usize>();
         let mut fence_vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
         fence_vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = value as usize;
@@ -168,9 +200,20 @@ mod tests {
         let result = unsafe {
             let fence = ID3D12Fence::from_raw_borrowed(&fence_raw).unwrap();
             let dev = ID3D12Device::from_raw_borrowed(&device_raw).unwrap();
-            wait(fence, target, dev, None, 0)
+            wait_observed(fence, target, dev, None, timeout, slow)
         };
         (result, mock_fence.arms.get())
+    }
+
+    #[test]
+    fn slow_observation_does_not_rearm_or_end_the_wait_at_one_second() {
+        let mut samples = Vec::new();
+        let (result, arms) = mock_wait_observed(
+            6, 7, None, S_OK, S_OK, (1_050, Some(&mut |done, timed_out| samples.push((done, timed_out)))),
+        );
+        assert!(matches!(result, Err(FenceError::Timeout(1_050))));
+        assert_eq!(samples, [(6, true)]);
+        assert_eq!(arms, 1);
     }
 
     #[test]

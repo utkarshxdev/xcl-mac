@@ -226,6 +226,7 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
+    signalled: u64,
     pools: Vec<ID3D12Heap>,
     free: Vec<Tile>,
     /// tiles given back, reusable after `COOL`
@@ -265,6 +266,7 @@ impl Pages {
             queue,
             fence,
             value: 0,
+            signalled: 0,
             pools: Vec::new(),
             free: Vec::new(),
             cooling: std::collections::VecDeque::new(),
@@ -331,8 +333,7 @@ impl Pages {
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.mapping_changed();
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -353,8 +354,14 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        self.mapping_changed();
+    }
+
+    unsafe fn mapping_changed(&mut self) {
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        if let Err(e) = advance_mapping_fence(&mut self.signalled, self.value, |value| self.queue.Signal(&self.fence, value)) {
+            crate::xlog_warn!("D3D12.X: texture page mapping signal for {:#x} is pending: {e}", self.value);
+        }
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -589,22 +596,35 @@ fn forget_pages(resource: usize) {
     }
 }
 
-/// Before GPU work on `queue`: it waits for the pages mapped since its last work on that device.
-pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+/// Only record a mapping signal or wait once the queue accepted it.
+fn advance_mapping_fence<E>(previous: &mut u64, value: u64, enqueue: impl FnOnce(u64) -> Result<(), E>) -> Result<bool, E> {
+    if *previous >= value {
+        return Ok(false);
+    }
+    enqueue(value)?;
+    *previous = value;
+    Ok(true)
+}
+
+/// Before GPU work on `queue` it waits for pages mapped since its last work on that device.
+pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) -> Result<(), String> {
     let mut dev: Option<ID3D12Device> = None;
-    if queue.GetDevice(&mut dev).is_err() {
-        return;
-    }
-    let Some(dev) = dev else { return };
+    queue.GetDevice(&mut dev).map_err(|e| format!("texture page mapping consumer device: {e}"))?;
+    let dev = dev.ok_or("texture page mapping consumer has no device")?;
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return Ok(()) };
     let key = queue.as_raw() as usize;
-    if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-        if queue.Wait(&pages.fence, pages.value).is_ok() && super::list_x::trace_gpu_stall() {
-            super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
-        }
-        pages.waited.insert(key, pages.value);
+    let value = pages.value;
+    advance_mapping_fence(&mut pages.signalled, value, |v| pages.queue.Signal(&pages.fence, v))
+        .map_err(|e| format!("texture page mapping producer signal for {value:#x}, queue {key:#x}: {e}"))?;
+    let waited = pages.waited.entry(key).or_default();
+    if advance_mapping_fence(waited, value, |v| queue.Wait(&pages.fence, v))
+        .map_err(|e| format!("texture page mapping consumer wait for {value:#x}, queue {key:#x}: {e}"))?
+        && super::list_x::trace_gpu_stall()
+    {
+        super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, value);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -711,6 +731,25 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejected_mapping_signal_and_wait_stay_pending_until_retry() {
+        let mut signalled = 3;
+        let mut waited = 2;
+        assert_eq!(super::advance_mapping_fence(&mut signalled, 4, |_| Err("signal")), Err("signal"));
+        assert_eq!(signalled, 3);
+        assert_eq!(super::advance_mapping_fence(&mut signalled, 4, |v| {
+            assert_eq!(v, 4);
+            Ok::<_, &str>(())
+        }), Ok(true));
+        assert_eq!(super::advance_mapping_fence(&mut waited, signalled, |_| Err("wait")), Err("wait"));
+        assert_eq!(waited, 2);
+        assert_eq!(super::advance_mapping_fence(&mut waited, signalled, |_| Ok::<_, &str>(())), Ok(true));
+        assert_eq!(waited, 4);
+        assert_eq!(super::advance_mapping_fence(&mut waited, signalled, |_| -> Result<(), &str> {
+            panic!("the queue already accepted this wait")
+        }), Ok(false));
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 

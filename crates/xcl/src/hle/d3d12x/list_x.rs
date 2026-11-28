@@ -1125,7 +1125,7 @@ pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D1
     }
 }
 
-fn internal_waits_summary() -> String {
+pub(super) fn internal_waits_summary() -> String {
     let snapshot = INTERNAL_WAITS.lock().unwrap().clone().unwrap_or_default();
     let mut parts = Vec::new();
     for (queue, waits) in snapshot {
@@ -2846,9 +2846,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return;
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
-        let mut g = LISTS.lock().unwrap();
-        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
+    let queue = {
+        let g = LISTS.lock().unwrap();
+        let Some(s) = g.as_ref().and_then(|m| m.get(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
                 crate::xlog_info!("D3D12.X: KickoffX – list allocator unknown, deferring to Close + ExecuteCommandLists");
             }
@@ -2866,6 +2866,15 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             }
             return;
         };
+        q
+    };
+    let q_raw = queue as *mut c_void;
+    if let Err(err) = super::title_textures::refresh(q_raw) {
+        super::title_textures::stop_blocked_submission(q_raw, &err);
+    }
+    let (alloc, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else { return };
         let active_query = s.occlusion.end_active_early();
         let waits = if s.pending_waits.is_empty() {
             Vec::new()
@@ -2879,7 +2888,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
+        (s.allocator, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
     };
     let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
 
@@ -2900,8 +2909,6 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
 
-    let q_raw = queue as *mut c_void;
-    super::title_textures::refresh(q_raw);
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
 
