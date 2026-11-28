@@ -11,7 +11,7 @@
   <img src="docs/media/gtavi_setup_preview.gif" alt="Grand Theft Auto VI running on Apple Silicon via XCL Mac Native" width="720">
 </p>
 <p align="center">
-  <b>Grand Theft Auto VI</b> running natively on Apple Silicon via <b>XCL Mac Native</b> under CrossOver & Apple D3DMetal (30.0 FPS locked presentation & setup sequence).
+  <b>Game Running</b> running natively on Apple Silicon via <b>XCL Mac Native</b> under CrossOver & Apple D3DMetal (30.0 FPS locked presentation & setup sequence).
 </p>
 
 <p align="center">
