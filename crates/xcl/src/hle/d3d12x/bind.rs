@@ -758,7 +758,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 return;
             }
             let repack = indirect::Repack { signature: &signature, resource: args, offset: args_off, max, gfx };
-            bind_abi_before(this, list, pso, gfx, |layout, inline, shadow, io, root| {
+            bind_abi_before(this, list, pso, gfx, [0; 3], |layout, inline, shadow, io, root| {
                 let u = crate::gpu::uma::get().ok_or("no unified memory")?;
                 repack.record(list, root, layout.ok_or("no bound console root layout")?, inline, shadow, io, |size| {
                     with(this, |s| s.arena.take(u, size, 16, &mut s.uma)).map(|p| p as usize)
@@ -1290,9 +1290,38 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    dispatch_with_flags(this, [x, y, z], None);
+}
+
+/// Only the thread-dimensions bit changes the grid. The shader supplies the wave mode.
+const THREAD_DIMENSIONS: u32 = 0x20;
+
+fn dispatch_grid(size: [u32; 3], flags: u32, group_size: Option<[u32; 3]>) -> Result<([u32; 3], [u32; 3]), &'static str> {
+    let mut groups = size;
+    let mut limits = [0; 3];
+    if flags & THREAD_DIMENSIONS != 0 {
+        let shape = group_size.filter(|shape| shape.iter().all(|n| (1..=1024).contains(n)))
+            .ok_or("no verified compute thread-group size")?;
+        for i in 0..3 {
+            groups[i] = size[i].div_ceil(shape[i]);
+            if size[i] % shape[i] != 0 {
+                limits[i] = size[i];
+            }
+        }
+    }
+    if groups.iter().any(|&n| n > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION) {
+        return Err("dispatch exceeds the D3D12 group limit");
+    }
+    Ok((groups, limits))
+}
+
+pub(super) unsafe fn dispatch_with_flags(this: *mut c_void, requested: [u32; 3], flags: Option<u32>) {
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
+        if let Some(flags) = flags {
+            super::list_x::note_dispatch_x(this, pso, requested, flags, None, Err("compute pipeline unavailable"));
+        }
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1302,7 +1331,18 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
-    match translated_dispatch(this, list, pso, x, y, z) {
+    let group_size = flags.and_then(|_| super::real::compute_group_size(pso));
+    let launch = dispatch_grid(requested, flags.unwrap_or(0), group_size);
+    if let Some(flags) = flags {
+        super::list_x::note_dispatch_x(this, pso, requested, flags, group_size, launch);
+    }
+    let result = launch.map_err(str::to_owned).and_then(|(groups, limits)| {
+        if groups.contains(&0) {
+            return Ok(());
+        }
+        translated_dispatch(this, list, pso, groups, limits, flags.is_none())
+    });
+    match result {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -1419,12 +1459,14 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
-unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
+unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, [x, y, z]: [u32; 3], limits: [u32; 3], trace_plain_dispatch: bool) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
-    bind_abi(this, list, pso, false)?;
-    super::list_x::note_stall_work(this, "dispatch", pso, [x.into(), y.into(), z.into()]);
+    bind_abi_before(this, list, pso, false, limits, |_, _, _, _, _| Ok(()))?;
+    if trace_plain_dispatch {
+        super::list_x::note_stall_work(this, "dispatch", pso, [x.into(), y.into(), z.into()]);
+    }
     list.Dispatch(x, y, z);
     Ok(())
 }
@@ -1433,11 +1475,11 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
-    bind_abi_before(this, list, pso, gfx, |_, _, _, _, _| Ok(()))
+    bind_abi_before(this, list, pso, gfx, [0; 3], |_, _, _, _, _| Ok(()))
 }
 
 unsafe fn bind_abi_before<T>(
-    this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool,
+    this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, limits: [u32; 3],
     before: impl FnOnce(Option<&Layout>, usize, &[u8], &[u32], &ID3D12RootSignature) -> Result<T, String>,
 ) -> Result<T, String> {
     if crate::util::mac_host() {
@@ -1471,6 +1513,10 @@ unsafe fn bind_abi_before<T>(
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    if !gfx {
+        let at = crate::gpu::recomp::IO_DISPATCH_LIMIT;
+        io[at..at + 3].copy_from_slice(&limits);
+    }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
@@ -1521,6 +1567,17 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn dispatch_x_converts_thread_counts_and_masks_only_partial_axes() {
+        assert_eq!(dispatch_grid([45, 8, 1], THREAD_DIMENSIONS, Some([64, 4, 1])), Ok(([1, 2, 1], [45, 0, 0])));
+        assert_eq!(dispatch_grid([128, 5, 1], THREAD_DIMENSIONS | 0x8000, Some([64, 4, 1])), Ok(([2, 2, 1], [0, 5, 0])));
+        assert_eq!(dispatch_grid([7, 2, 1], 0, None), Ok(([7, 2, 1], [0; 3])));
+        assert_eq!(dispatch_grid([7, 2, 1], 0x40, None), Ok(([7, 2, 1], [0; 3])));
+        assert_eq!(dispatch_grid([0, 1, 1], THREAD_DIMENSIONS, Some([64, 1, 1])), Ok(([0, 1, 1], [0; 3])));
+        assert!(dispatch_grid([45, 1, 1], THREAD_DIMENSIONS, None).is_err());
+        assert!(dispatch_grid([65_536, 1, 1], 0, None).is_err());
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]

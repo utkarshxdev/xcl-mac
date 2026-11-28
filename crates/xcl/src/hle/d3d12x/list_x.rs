@@ -1142,6 +1142,7 @@ pub(super) fn internal_waits_summary() -> String {
 pub(super) fn log_gpu_stall(queue: usize) {
     crate::xlog_warn!("D3D12.X: bottom-of-pipe producer q{} ({queue:#x}) stalled; XCL queue waits: {}", queue_id(queue), internal_waits_summary());
     crate::xlog_warn!("D3D12.X: pending title fences during bottom-of-pipe stall: {}", super::fence_x::pending_summary());
+    log_recent_submissions();
 }
 
 fn queue_id(q: usize) -> usize {
@@ -1962,6 +1963,7 @@ struct StallWork {
     kind: &'static str,
     pso: usize,
     parameters: [u64; 3],
+    dispatch_x: Option<String>,
 }
 
 /// Keep recent recorded operations per list; the submission takes a snapshot before list reuse.
@@ -1969,31 +1971,106 @@ pub(super) fn note_stall_work(list: *mut c_void, kind: &'static str, pso: usize,
     if !trace_gpu_stall() {
         return;
     }
+    push_stall_work(list, StallWork { kind, pso, parameters, dispatch_x: None });
+}
+
+pub(super) fn note_dispatch_x(
+    list: *mut c_void, pso: usize, requested: [u32; 3], flags: u32, group_size: Option<[u32; 3]>,
+    launch: Result<([u32; 3], [u32; 3]), &'static str>,
+) {
+    if !trace_gpu_stall() {
+        return;
+    }
+    let details = format!("flags={flags:#x} group_size={group_size:?} launch(groups, limits)={launch:?}");
+    static FLAGGED: AtomicU64 = AtomicU64::new(0);
+    if flags != 0 && once(&FLAGGED, 8) {
+        crate::xlog_info!("D3D12.X: DispatchX list {list:p}, pso {pso:#x}, requested {requested:?}, {details}");
+    }
+    push_stall_work(list, StallWork { kind: "DispatchX", pso, parameters: requested.map(u64::from), dispatch_x: Some(details) });
+}
+
+fn push_stall_work(list: *mut c_void, work: StallWork) {
     if let Some(state) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         if state.stall_work.len() == 16 {
             state.stall_work.pop_front();
         }
-        state.stall_work.push_back(StallWork { kind, pso, parameters });
+        state.stall_work.push_back(work);
     }
 }
 
-fn stall_lists(lists: &[*mut c_void]) -> Vec<String> {
+fn capture_list_work(lists: &[*mut c_void], max_lists: usize, max_operations: usize) -> Vec<String> {
     if !trace_gpu_stall() {
         return Vec::new();
     }
     let g = LISTS.lock().unwrap();
     let mut trace = Vec::new();
-    for &list in lists.iter().rev().take(24).rev() {
+    for &list in lists.iter().rev().take(max_lists).rev() {
         let Some(state) = g.as_ref().and_then(|m| m.get(&(list as usize))) else {
             trace.push(format!("list {list:p} (untracked)"));
             continue;
         };
-        let work: Vec<_> = state.stall_work.iter().map(|w| {
-            format!("{} pso={:#x} params={:x?}", w.kind, w.pso, w.parameters)
+        let work: Vec<_> = state.stall_work.iter().rev().take(max_operations).rev().map(|w| {
+            let mut label = format!("{} pso={:#x} params={:x?}", w.kind, w.pso, w.parameters);
+            if let Some(details) = &w.dispatch_x {
+                label.push(' ');
+                label.push_str(details);
+            }
+            label
         }).collect();
         trace.push(format!("list {list:p} type={:?} last PSO={:#x}; {}", state.list_type, state.bound_pso, work.join(", ")));
     }
     trace
+}
+
+fn stall_lists(lists: &[*mut c_void]) -> Vec<String> {
+    capture_list_work(lists, 24, 16)
+}
+
+#[derive(Clone)]
+struct SubmissionTrace {
+    queue: usize,
+    at: Instant,
+    count: usize,
+    lists: Vec<String>,
+}
+
+static RECENT_SUBMISSIONS: Mutex<VecDeque<SubmissionTrace>> = Mutex::new(VecDeque::new());
+
+/// Track the latest handoff to each host queue even when there is no CPU write to fence.
+pub(super) fn note_submission(queue: *mut c_void, lists: &[*mut c_void]) {
+    if !trace_gpu_stall() || lists.is_empty() {
+        return;
+    }
+    let trace = SubmissionTrace {
+        queue: queue as usize,
+        at: Instant::now(),
+        count: lists.len(),
+        lists: capture_list_work(lists, 4, 4),
+    };
+    let mut recent = RECENT_SUBMISSIONS.lock().unwrap();
+    recent.retain(|entry| entry.queue != trace.queue);
+    if recent.len() == 8 {
+        recent.pop_front();
+    }
+    recent.push_back(trace);
+}
+
+pub(crate) fn log_recent_submissions() {
+    if !trace_gpu_stall() {
+        return;
+    }
+    let Ok(recent) = RECENT_SUBMISSIONS.try_lock() else {
+        crate::xlog_info!("D3D12.X: recent queue submission snapshot busy");
+        return;
+    };
+    let snapshot = recent.clone();
+    drop(recent);
+    for SubmissionTrace { queue, at, count, lists } in snapshot {
+        crate::xlog_info!("D3D12.X: last host submission on queue {queue:#x}, {} ms ago, {count} lists", at.elapsed().as_millis());
+        for list in lists {
+            crate::xlog_info!("D3D12.X: recent submission {list}");
+        }
+    }
 }
 
 /// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
@@ -2648,8 +2725,8 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
 }
 
 /// command list #78 DispatchX(x, y, z, flags)
-pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
-    super::bind::dispatch(this, x, y, z);
+pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    super::bind::dispatch_with_flags(this, [x, y, z], Some(flags));
 }
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
@@ -2918,6 +2995,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
+                note_submission(q_raw, chunk);
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
@@ -2936,6 +3014,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
+    note_submission(q_raw, &one);
     exec(q_raw, 1, one.as_ptr());
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);

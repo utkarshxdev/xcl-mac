@@ -121,7 +121,7 @@ GameInput retains half a second of recent gamepad changes for titles that read i
 | `XCL_COHERENT_HEAPS` | `0` (Off) | `1` (On) | Avoids write-watch page protection traps on coherent heaps |
 | `XCL_WATCHDOG_BYPASS` | Off | — | Enables recovery for recognized watchdog sites. Unknown traps still follow normal exception handling. |
 | `XCL_DSTORAGE_BCPACK_ACCEPT` | Off | — | Set to `1` to complete eligible BCPack requests with solid placeholder blocks. Texture decompression is required for the original pixels. |
-| `XCL_TRACE_GPU_STALL` | Off | `1` | Logs stalled GPU work, including slow texture uploads, their fence values, and outstanding page-mapping waits |
+| `XCL_TRACE_GPU_STALL` | Off | `1` | Logs slow texture uploads, fence values, page-mapping waits, and DispatchX flags and group sizes. Stalls and timed thread dumps include recent host queue submissions. |
 | `XCL_PLAYSTATION_PAD` | `1` | `1` | Use a supported DualShock 4 or USB DualSense when XInput finds no controller. Set to `0` to disable. |
 | `XCL_PRESENT_PLANE` | `0` | `0` | Set to `1` to try the second PresentX plane. The log shows the requested and active planes and whether the resources can be presented. |
 | `XCL_PRESENT_COMPOSITE` | `0` | `0` | On Windows, set to `1` and unset `XCL_PRESENT_PLANE` to blend compatible overlays. Mac hosts use individual planes. |

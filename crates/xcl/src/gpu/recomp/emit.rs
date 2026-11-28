@@ -4442,7 +4442,14 @@ impl Em {
                     // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
-                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                // Keep every hardware lane in the ballot and split-wave rendezvous, even
+                // when it represents a console lane outside a partial thread group.
+                let _ = writeln!(
+                    h,
+                    "    uint3 dispatch_limit = io.Load3({}u);\n    uint3 dispatch_tid = gid * uint3({x}u, {y}u, {z}u) + gtid;\n    bool dispatch_lane = all((dispatch_limit == 0u) | (dispatch_tid < dispatch_limit));\n    uint scc = 0u;\n    {{ uint2 e0 = {}(dispatch_lane); exec_lo = e0.x; exec_hi = e0.y; }}",
+                    super::IO_DISPATCH_LIMIT * 4,
+                    self.ballot_fn(),
+                );
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",

@@ -176,6 +176,8 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// DispatchX thread limits in XYZ order. Zero leaves that axis unmasked.
+pub const IO_DISPATCH_LIMIT: usize = 113;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

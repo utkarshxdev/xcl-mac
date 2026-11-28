@@ -4297,6 +4297,39 @@ fn gpu_compute_mode_dispatch_abi() {
     }
 }
 
+/// Run two groups for 77 requested threads, then reuse the same shader in ordinary group mode.
+#[test]
+fn gpu_dispatch_x_partial_group_leaves_out_of_range_words_untouched() {
+    if !gpu_ready() {
+        return;
+    }
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 1, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let p = prog(&[
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 1), ("SSRC1", 134)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 2), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 0), ("VSRC1", 3)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 3), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+    for wave64 in [false, true] {
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        assert_eq!(crate::gpu::dxbc::psv(&dxil).and_then(|psv| psv.numthreads), Some([64, 1, 1]));
+        let mut io = [0u32; super::KERNEL_SGPRS];
+        io[0] = 256;
+        for limit in [77, 0] {
+            io[super::IO_DISPATCH_LIMIT] = limit;
+            let out = runner::dispatch(&dxil, [2, 1, 1], &io, &[0; 192]).unwrap();
+            for (tid, &word) in out[64..192].iter().enumerate() {
+                assert_eq!(word, u32::from(limit == 0 || tid < limit as usize), "wave64={wave64}, limit={limit}, thread {tid}");
+            }
+        }
+    }
+}
+
 /// A wave32 program in a 64-lane hardware wave (what VS / PS may get from the driver): the
 /// two halves behave as separate waves – ballots, lane counts, readlane and mbcnt per half.
 #[test]

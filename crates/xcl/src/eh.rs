@@ -174,6 +174,7 @@ pub fn install_crash_handler() {
                         std::thread::sleep(wait);
                     }
                     crate::xlog_info!("thread stacks {t} s into the run (XCL_DUMP_THREADS_AT):");
+                    crate::hle::d3d12x::list_x::log_recent_submissions();
                     dump_threads();
                     // `XCL_PEEK=140a210d81:1,14a210d60:8`: title globals by their address in the
                     // image as linked (hex) and size in bytes, read at the same moment

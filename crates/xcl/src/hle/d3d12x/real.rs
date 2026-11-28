@@ -1881,6 +1881,9 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    if let Some(groups) = PSO_COMPUTE_GROUPS.lock().unwrap().as_mut() {
+        groups.remove(&pso);
+    }
     super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
@@ -3802,6 +3805,13 @@ pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
     PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
+/// Actual thread-group dimensions of each translated DXIL compute pipeline.
+static PSO_COMPUTE_GROUPS: Mutex<Option<HashMap<usize, [u32; 3]>>> = Mutex::new(None);
+
+pub(super) fn compute_group_size(pso: usize) -> Option<[u32; 3]> {
+    PSO_COMPUTE_GROUPS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
     let pso = super::pso_async::resolve(pso);
@@ -3995,6 +4005,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     note_pso_rs(*ppv, rs);
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    }
+    if let Some(size) = crate::gpu::dxbc::psv(&dxil).and_then(|header| header.numthreads) {
+        PSO_COMPUTE_GROUPS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, size);
     }
     note_translated_compute(hr, ppv);
     if super::list_x::trace_gpu_stall() {
@@ -5845,6 +5858,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
+        super::list_x::note_submission(this, chunk);
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
