@@ -350,10 +350,24 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     let composite = plane_count >= 2
         && active_plane == 0
         && std::env::var_os("XCL_PRESENT_PLANE").is_none()
-        && std::env::var("XCL_PRESENT_COMPOSITE").is_ok_and(|mode| mode == "1");
+        && composition_enabled();
     let sources = if composite { extract_planes(plane_count, planes) } else { vec![(res, None)] };
     present_now(Duration::ZERO, Some((queue as usize, sources)));
     tokens
+}
+
+fn composition_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !std::env::var("XCL_PRESENT_COMPOSITE").is_ok_and(|mode| mode == "1") {
+            return false;
+        }
+        if crate::util::mac_host() {
+            crate::xlog_warn!("present: multi-plane compositing is disabled on Mac hosts; showing plane 0");
+            return false;
+        }
+        true
+    })
 }
 
 thread_local! {
