@@ -8,10 +8,10 @@
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS%20%7C%20Apple%20Silicon-black?logo=apple)](https://github.com/utkarshxdev/xcl-mac)
 
 <p align="center">
-  <img src="docs/media/gtavi_setup_preview.gif" alt="Grand Theft Auto VI running on Apple Silicon via XCL Mac Native" width="720">
+  <img src="docs/media/gtavi_intro_preview.gif" alt="Grand Theft Auto VI running on Apple Silicon via XCL Mac Native" width="720">
 </p>
 <p align="center">
-  <b>Game Running</b> running natively on Apple Silicon via <b>XCL Mac Native</b> under CrossOver & Apple D3DMetal (30.0 FPS locked presentation & setup sequence).
+  <b>Grand Theft Auto VI</b> running natively on Apple Silicon via <b>XCL Mac Native</b> under CrossOver & Apple D3DMetal (30.0 FPS locked presentation & intro sequence).
 </p>
 
 <p align="center">
